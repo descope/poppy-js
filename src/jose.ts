@@ -1,7 +1,9 @@
 const encoder = new TextEncoder();
 
 export function base64url(bytes: ArrayBuffer | Uint8Array): string {
-  return Buffer.from(bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes)).toString("base64url");
+  return Buffer.from(bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes)).toString(
+    "base64url",
+  );
 }
 
 /** A random identifier with 128 bits of entropy (spec 4.2 `jti`). */
@@ -13,7 +15,11 @@ export async function sha256(value: string): Promise<string> {
   return base64url(await crypto.subtle.digest("SHA-256", encoder.encode(value)));
 }
 
-export const ES256: EcKeyImportParams & EcdsaParams = { name: "ECDSA", namedCurve: "P-256", hash: "SHA-256" };
+export const ES256: EcKeyImportParams & EcdsaParams = {
+  name: "ECDSA",
+  namedCurve: "P-256",
+  hash: "SHA-256",
+};
 
 /** Signs a compact JWS with ES256. WebCrypto already returns the raw r||s signature JWS expects. */
 export async function signJwt(

@@ -12,6 +12,7 @@
     "noPropertyAccessFromIndexSignature": true,
     "verbatimModuleSyntax": true,
     "isolatedModules": true,
+    "rewriteRelativeImportExtensions": true,
     "skipLibCheck": true,
     "noEmit": true
   },

@@ -15,6 +15,7 @@
     "node": ">=22"
   },
   "sideEffects": false,
+  "packageManager": "pnpm@11.1.2",
   "keywords": ["poppy", "personal-agent", "oauth", "dpop", "agent"],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",

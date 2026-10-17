@@ -82,7 +82,9 @@ export async function errorFromResponse(response: Response): Promise<PoppyError>
   } catch {
     body = undefined;
   }
-  const code = stringField(body, "error") ?? (response.status === 429 ? "rate_limited" : `http_${response.status}`);
+  const code =
+    stringField(body, "error") ??
+    (response.status === 429 ? "rate_limited" : `http_${response.status}`);
   return new PoppyError(code, {
     status: response.status,
     description: stringField(body, "error_description"),

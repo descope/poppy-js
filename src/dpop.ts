@@ -23,7 +23,11 @@ export class DpopKey {
   }
 
   /** Builds a proof for one request. `htu` drops the query and fragment (RFC 9449 4.2). */
-  async proof(method: string, url: string, options: { accessToken?: string; nonce?: string } = {}): Promise<string> {
+  async proof(
+    method: string,
+    url: string,
+    options: { accessToken?: string; nonce?: string } = {},
+  ): Promise<string> {
     const target = new URL(url);
     const payload: Record<string, unknown> = {
       jti: randomId(),

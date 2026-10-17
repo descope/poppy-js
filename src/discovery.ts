@@ -54,19 +54,23 @@ function websiteUrl(website: string): URL {
   return new URL("/.well-known/poppy.json", url.origin);
 }
 
+const KNOWN_API_TYPES = new Set(["openapi", "mcp"]);
+
+/** Keeps the API types this version knows and skips the rest unchecked, so later types can be added (spec 6). */
 function parseApis(value: unknown): Api[] {
   if (value === undefined) return [];
   if (!Array.isArray(value)) throw new PoppyProtocolError("apis must be a list");
-  return value.map((entry, index) => {
+  const apis: Api[] = [];
+  value.forEach((entry, index) => {
     if (!isObject(entry)) throw new PoppyProtocolError(`apis[${index}] must be an object`);
-    const api: Api = {
-      type: string(entry["type"], `apis[${index}].type`),
-      url: httpsUrl(entry["url"], `apis[${index}].url`).href,
-    };
+    const type = entry["type"];
+    if (typeof type !== "string" || !KNOWN_API_TYPES.has(type)) return;
+    const api: Api = { type, url: httpsUrl(entry["url"], `apis[${index}].url`).href };
     if (typeof entry["description"] === "string") api.description = entry["description"];
     if (typeof entry["resource"] === "string") api.resource = entry["resource"];
-    return api;
+    apis.push(api);
   });
+  return apis;
 }
 
 function agentHosts(agent: unknown): string[] {

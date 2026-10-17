@@ -2,21 +2,25 @@
   "name": "@descope/poppy",
   "version": "0.1.0",
   "description": "TypeScript client for the Personal Agent Protocol (Poppy): discovery, Sessions, Device Sign-In and DPoP-bound API calls.",
+  "keywords": [
+    "agent",
+    "dpop",
+    "oauth",
+    "personal-agent",
+    "poppy"
+  ],
   "license": "Apache-2.0",
+  "files": [
+    "dist"
+  ],
   "type": "module",
+  "sideEffects": false,
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
     }
   },
-  "files": ["dist"],
-  "engines": {
-    "node": ">=22"
-  },
-  "sideEffects": false,
-  "packageManager": "pnpm@11.1.2",
-  "keywords": ["poppy", "personal-agent", "oauth", "dpop", "agent"],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
@@ -31,5 +35,9 @@
     "oxlint": "1.88.0",
     "typescript": "7.0.2",
     "vitest": "5.0.5"
-  }
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "packageManager": "pnpm@11.1.2"
 }

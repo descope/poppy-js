@@ -94,7 +94,10 @@ export class PoppyAgent {
   readonly #fetch: Fetch;
 
   constructor(options: PoppyAgentOptions) {
-    this.clientId = httpsUrl(options.clientId, "clientId").href;
+    if (httpsUrl(options.clientId, "clientId").href !== options.clientId) {
+      throw new PoppyProtocolError("clientId must be a normalized URL, exactly as published");
+    }
+    this.clientId = options.clientId;
     this.#signingKey = options.signingKey;
     this.#store = options.store ?? new MemoryStore();
     this.#fetch = options.fetch ?? fetch;
@@ -359,6 +362,11 @@ export class Session {
     }
     if (url.username !== "" || url.password !== "")
       throw new PoppyProtocolError("API URL must not carry credentials");
+    if (init.body instanceof ReadableStream) {
+      throw new PoppyProtocolError(
+        "streaming bodies are not supported, since a retry resends the body",
+      );
+    }
     const method = (init.method ?? "GET").toUpperCase();
     let nonceRetried = false;
     let renewed = false;
@@ -451,7 +459,11 @@ export class Session {
           device_code: deviceCode,
           ...this.#sessionParam(),
         })),
-      (token) => this.#applyToken(token),
+      async (token) => {
+        // A signed-out renew still in flight must not land after, and overwrite, the signed-in token.
+        await this.#renewing?.catch(() => undefined);
+        await this.#applyToken(token);
+      },
     );
   }
 

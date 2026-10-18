@@ -9,7 +9,9 @@ import {
 } from "../src/index.ts";
 import {
   API,
+  CLIENT_ID,
   DEVICE_ENDPOINT,
+  ISSUER,
   MockCompany,
   REVOCATION_ENDPOINT,
   TOKEN_ENDPOINT,
@@ -585,7 +587,45 @@ describe("forget", () => {
     mock.routes.set(REVOCATION_ENDPOINT, () => new Response(null, { status: 503 }));
     await agent.forget(company, USER_ID);
     expect(store.values.size).toBe(0);
+    const tokenCalls = mock.callsTo(TOKEN_ENDPOINT).length;
     await expect(session.fetch(`${API}/a`)).rejects.toBeInstanceOf(PoppyProtocolError);
+    await expect(session.renew()).rejects.toBeInstanceOf(PoppyProtocolError);
+    expect(mock.callsTo(TOKEN_ENDPOINT)).toHaveLength(tokenCalls);
+  });
+
+  it("opens a Session requested during forget only after the state is deleted", async () => {
+    const { mock, company, store } = await setup();
+    let release = () => {};
+    const held = new Promise<void>((resolve) => (release = resolve));
+    let revoking = () => {};
+    const revokeHeld = new Promise<void>((resolve) => (revoking = resolve));
+    const { fetch } = mock;
+    mock.fetch = async (input, init) => {
+      if (String(input) === REVOCATION_ENDPOINT) {
+        revoking();
+        await held;
+      }
+      return fetch(input, init);
+    };
+    const agent = mock.agent({ store });
+    await signIn(mock, await agent.session(company, USER_ID));
+    const forgetting = agent.forget(company, USER_ID);
+    await revokeHeld;
+    const opening = agent.session(company, USER_ID);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    release();
+    await forgetting;
+    const next = await opening;
+    expect(store.values.size).toBe(1);
+    expect(store.state()).not.toHaveProperty("accountToken");
+    expect((await (await next.fetch(`${API}/a`)).json()).signedIn).toBe(false);
+  });
+
+  it("deletes stored state it cannot read", async () => {
+    const { agent, company, store } = await setup();
+    await store.set(`poppy:${CLIENT_ID}:${ISSUER}:${USER_ID}`, "not json");
+    await agent.forget(company, USER_ID);
+    expect(store.values.size).toBe(0);
   });
 
   it("does not write the state back from a renew queued behind the sign-out", async () => {

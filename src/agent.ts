@@ -96,6 +96,8 @@ export class PoppyAgent {
   readonly #store: Store;
   readonly #fetch: Fetch;
   readonly #sessions = new Map<string, Promise<Session>>();
+  /** In-flight {@link forget} calls per store key. Opening that User waits for them, so it cannot be erased. */
+  readonly #forgetting = new Map<string, Promise<void>>();
 
   constructor(options: PoppyAgentOptions) {
     if (httpsUrl(options.clientId, "clientId").href !== options.clientId) {
@@ -124,7 +126,11 @@ export class PoppyAgent {
     // One live Session per stored state, so two Sessions never overwrite each other's Account Token.
     let session = this.#sessions.get(storeKey);
     if (session === undefined) {
-      session = this.#openSession(company, userId, storeKey);
+      const forgetting = this.#forgetting.get(storeKey);
+      session =
+        forgetting === undefined
+          ? this.#openSession(company, userId, storeKey)
+          : forgetting.then(() => this.#openSession(company, userId, storeKey));
       session.catch(() => this.#sessions.delete(storeKey));
       this.#sessions.set(storeKey, session);
     }
@@ -136,19 +142,33 @@ export class PoppyAgent {
    * Sessions opened before stop working; the next {@link session} call starts a new, signed-out one.
    * A failed revocation does not stop the state from being deleted.
    */
-  async forget(company: Company, userId: string): Promise<void> {
+  forget(company: Company, userId: string): Promise<void> {
     const storeKey = this.#storeKey(company, userId);
     const open = this.#sessions.get(storeKey);
-    let session: Session | undefined;
-    if (open !== undefined) {
-      session = await open.catch(() => undefined);
-    } else if (await this.#hasAccountToken(storeKey)) {
+    this.#sessions.delete(storeKey);
+    const previous = this.#forgetting.get(storeKey) ?? Promise.resolve();
+    const forgetting = previous.then(() => this.#erase(company, userId, storeKey, open));
+    const barrier = forgetting.catch(() => undefined);
+    this.#forgetting.set(storeKey, barrier);
+    void barrier.then(() => {
+      if (this.#forgetting.get(storeKey) === barrier) this.#forgetting.delete(storeKey);
+    });
+    return forgetting;
+  }
+
+  async #erase(
+    company: Company,
+    userId: string,
+    storeKey: string,
+    open: Promise<Session> | undefined,
+  ): Promise<void> {
+    let session = await open?.catch(() => undefined);
+    if (open === undefined && (await this.#hasAccountToken(storeKey))) {
       // Only then: opening a Session without an Account Token would start a new one at the Company.
-      session = await this.session(company, userId).catch(() => undefined);
+      session = await this.#openSession(company, userId, storeKey).catch(() => undefined);
     }
     await session?.signOut().catch(() => undefined);
     if (session !== undefined) forgotten.add(session);
-    this.#sessions.delete(storeKey);
     await this.#store.delete(storeKey);
   }
 
@@ -158,9 +178,12 @@ export class PoppyAgent {
 
   async #hasAccountToken(storeKey: string): Promise<boolean> {
     const stored = await this.#store.get(storeKey);
-    return (
-      stored !== undefined && (JSON.parse(stored) as PersistedState).accountToken !== undefined
-    );
+    if (stored === undefined) return false;
+    try {
+      return (JSON.parse(stored) as PersistedState).accountToken !== undefined;
+    } catch {
+      return false;
+    }
   }
 
   async #openSession(company: Company, userId: string, storeKey: string): Promise<Session> {
@@ -248,6 +271,7 @@ export class Session {
   }
 
   async #renew(): Promise<void> {
+    this.#ensureNotForgotten();
     if (this.#state.accountToken !== undefined) {
       try {
         await this.#renewWith(() => this.#refreshParams(), this.#state.scope ?? "");

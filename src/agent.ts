@@ -97,7 +97,10 @@ export class PoppyAgent {
   readonly #store: Store;
   readonly #fetch: Fetch;
   readonly #sessions = new Map<string, Promise<Session>>();
-  /** In-flight {@link forget} calls per store key. Opening that User waits for them, so it cannot be erased. */
+  /**
+   * In-flight {@link forget} calls per store key. Opening that User waits for them, so it cannot be erased, and
+   * fails when they fail, so it cannot pick up state that was not deleted.
+   */
   readonly #forgetting = new Map<string, Promise<void>>();
 
   constructor(options: PoppyAgentOptions) {
@@ -147,13 +150,14 @@ export class PoppyAgent {
     const storeKey = this.#storeKey(company, userId);
     const open = this.#sessions.get(storeKey);
     this.#sessions.delete(storeKey);
-    const previous = this.#forgetting.get(storeKey) ?? Promise.resolve();
+    const previous = this.#forgetting.get(storeKey)?.catch(() => undefined) ?? Promise.resolve();
     const forgetting = previous.then(() => this.#erase(company, userId, storeKey, open));
-    const barrier = forgetting.catch(() => undefined);
-    this.#forgetting.set(storeKey, barrier);
-    void barrier.then(() => {
-      if (this.#forgetting.get(storeKey) === barrier) this.#forgetting.delete(storeKey);
-    });
+    this.#forgetting.set(storeKey, forgetting);
+    void forgetting
+      .catch(() => undefined)
+      .then(() => {
+        if (this.#forgetting.get(storeKey) === forgetting) this.#forgetting.delete(storeKey);
+      });
     return forgetting;
   }
 

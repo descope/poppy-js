@@ -621,6 +621,32 @@ describe("forget", () => {
     expect((await (await next.fetch(`${API}/a`)).json()).signedIn).toBe(false);
   });
 
+  it("fails a Session requested during forget when the state cannot be deleted", async () => {
+    const { mock, company, store } = await setup();
+    let release = () => {};
+    const held = new Promise<void>((resolve) => (release = resolve));
+    let revoking = () => {};
+    const revokeHeld = new Promise<void>((resolve) => (revoking = resolve));
+    mock.routes.set(REVOCATION_ENDPOINT, () => new Response(null, { status: 503 }));
+    const { fetch } = mock;
+    mock.fetch = async (input, init) => {
+      if (String(input) === REVOCATION_ENDPOINT) {
+        revoking();
+        await held;
+      }
+      return fetch(input, init);
+    };
+    const agent = mock.agent({ store });
+    await signIn(mock, await agent.session(company, USER_ID));
+    store.delete = () => Promise.reject(new Error("store unavailable"));
+    const forgetting = agent.forget(company, USER_ID);
+    await revokeHeld;
+    const opening = agent.session(company, USER_ID);
+    release();
+    await expect(forgetting).rejects.toThrow("store unavailable");
+    await expect(opening).rejects.toThrow("store unavailable");
+  });
+
   it("deletes stored state it cannot read", async () => {
     const { agent, company, store } = await setup();
     await store.set(`poppy:${CLIENT_ID}:${ISSUER}:${USER_ID}`, "not json");

@@ -1,6 +1,6 @@
 export { DeviceSignIn, PoppyAgent, Session, wwwAuthenticateError } from "./agent.ts";
 export type { DeviceSignInDetails, PoppyAgentOptions, SigningKey } from "./agent.ts";
-export { discover, isAllowedHost, metadataUrl } from "./discovery.ts";
+export { discover } from "./discovery.ts";
 export type { Api, Company } from "./discovery.ts";
 export { PoppyError, PoppyProtocolError } from "./errors.ts";
 export type { PoppyErrorCode } from "./errors.ts";

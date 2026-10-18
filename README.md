@@ -95,6 +95,8 @@ interface Store {
 
 The default `MemoryStore` loses everything on exit, so every restart starts new Sessions. In production, pass a store backed by encrypted storage. The SDK writes the new state before it uses a token response, so a crash cannot lose an Account Token the Company already rotated.
 
+Use one `PoppyAgent` per store in a process. The agent keeps one live Session per User and Company, but agents or processes that share a store do not coordinate, and can overwrite each other's Account Token. State is stored under the key `poppy:<clientId>:<issuer>:<userId>`; call `store.delete()` with that key to forget a User at a Company.
+
 ## User IDs
 
 `userId` is the ID your agent gives this User at this Company (spec 4.2). It must be:
@@ -124,10 +126,12 @@ Node.js 22 or later. Discovery follows redirects by hand so it can check that ev
 These parts of the spec are not in this release:
 
 - Direct Sign-In and Mediated Sign-In (4.5, 4.7)
-- Bearer Session Tokens for MCP servers (4.3)
+- Bearer Session Tokens for MCP servers (4.3). `session.fetch` sends DPoP to every host.
+- Session Tokens issued for a specific `resource` (4.3). `session.fetch` never requests one, so APIs or Company Agents that require one will refuse its token.
 - Web browsing (5)
 - Conversations with Company Agents (7)
 - Extensions (3.3)
+- Request timeouts. Pass a `fetch` that adds one, such as `(url, init) => fetch(url, { ...init, signal: AbortSignal.timeout(10_000) })`.
 
 ## Contributing
 

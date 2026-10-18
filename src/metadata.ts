@@ -9,10 +9,6 @@ export interface ClientMetadataInput {
   /** HTTPS URL of the key set from {@link jwks}, on the same host as `clientId`. */
   jwksUri: string;
   logoUri?: string;
-  /** Where Direct Sign-In may return the User. Same host as `clientId`. */
-  redirectUris?: string[];
-  /** Extensions this agent supports, keyed by name (spec 3.3). */
-  extensions?: Record<string, { version: string }>;
 }
 
 function sameHost(clientId: URL, value: string, what: string): string {
@@ -35,9 +31,7 @@ export function clientMetadata(input: ClientMetadataInput): Record<string, unkno
     client_name: input.clientName,
     ...(input.logoUri === undefined ? {} : { logo_uri: httpsUrl(input.logoUri, "logoUri").href }),
     jwks_uri: sameHost(clientId, input.jwksUri, "jwksUri"),
-    redirect_uris: (input.redirectUris ?? []).map((uri) => sameHost(clientId, uri, "redirectUris")),
     token_endpoint_auth_method: "private_key_jwt",
-    ...(input.extensions === undefined ? {} : { extensions: input.extensions }),
   };
 }
 

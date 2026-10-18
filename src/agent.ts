@@ -11,6 +11,8 @@ const CLIENT_ASSERTION_TYPE = "urn:ietf:params:oauth:client-assertion-type:jwt-b
 const ASSERTION_LIFETIME = 60;
 /** Renew this many seconds before a Session Token expires, so a request never races the expiry. */
 const EXPIRY_MARGIN = 30;
+/** Errors meaning the Session is over and a new one must be started (spec 4.2, 4.4). */
+const SESSION_ENDED = new Set(["invalid_session", "account_mismatch"]);
 
 /** The key the agent signs its client and Session assertions with. Its public half is in the agent's `jwks_uri`. */
 export interface SigningKey {
@@ -230,9 +232,7 @@ export class Session {
     try {
       await this.#applyToken(await this.#tokenRequest(params));
     } catch (error) {
-      const ended =
-        error instanceof PoppyError &&
-        (error.error === "invalid_session" || error.error === "account_mismatch");
+      const ended = error instanceof PoppyError && SESSION_ENDED.has(error.error);
       if (!ended || this.#state.sessionId === undefined) throw error;
       await this.#persist({ ...this.#state, sessionId: undefined });
       await this.#applyToken(await this.#tokenRequest(params));
@@ -465,12 +465,21 @@ export class Session {
         interval: typeof interval === "number" && interval > 0 ? interval : 5,
       },
       device_code,
-      (deviceCode) =>
-        this.#tokenRequest(async () => ({
-          grant_type: DEVICE_CODE,
-          device_code: deviceCode,
-          ...this.#sessionParam(),
-        })),
+      async (deviceCode) => {
+        try {
+          return await this.#tokenRequest(async () => ({
+            grant_type: DEVICE_CODE,
+            device_code: deviceCode,
+            ...this.#sessionParam(),
+          }));
+        } catch (error) {
+          // Spec 4.4: this Session cannot be signed in; the User signs in again in a new Session.
+          if (error instanceof PoppyError && SESSION_ENDED.has(error.error)) {
+            await this.#persist({ ...this.#state, sessionId: undefined });
+          }
+          throw error;
+        }
+      },
       async (token) => {
         // A signed-out renew still in flight must not land after, and overwrite, the signed-in token.
         await this.#renewing?.catch(() => undefined);
@@ -484,6 +493,8 @@ export class Session {
    * Does nothing when not signed in.
    */
   async signOut(): Promise<void> {
+    // A refresh in flight could rotate the Account Token, or land a signed-in token after the revoke.
+    await this.#renewing?.catch(() => undefined);
     const token = this.#state.accountToken;
     if (token === undefined) return;
     const body = new URLSearchParams({

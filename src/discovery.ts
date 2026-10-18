@@ -73,14 +73,13 @@ function parseApis(value: unknown): Api[] {
   return apis;
 }
 
+/** Hosts of the `poppy` conversation endpoints; other protocol types are skipped unchecked (spec 7.1). */
 function agentHosts(agent: unknown): string[] {
   if (!isObject(agent) || !Array.isArray(agent["protocols"])) return [];
-  return agent["protocols"].map(
-    (protocol, index) =>
-      httpsUrl(
-        isObject(protocol) ? protocol["endpoint"] : undefined,
-        `agent.protocols[${index}].endpoint`,
-      ).hostname,
+  return agent["protocols"].flatMap((protocol, index) =>
+    isObject(protocol) && protocol["type"] === "poppy"
+      ? [httpsUrl(protocol["endpoint"], `agent.protocols[${index}].endpoint`).hostname]
+      : [],
   );
 }
 

@@ -95,6 +95,18 @@ describe("PoppyAgent", () => {
     const { agent, company } = await setup();
     await expect(agent.session(company, "")).rejects.toThrow(/userId/);
   });
+
+  it("returns one Session per User, so a second one cannot drop the Account Token", async () => {
+    const { mock, agent, company, store } = await setup();
+    const [a, b] = await Promise.all([
+      agent.session(company, USER_ID),
+      agent.session(company, USER_ID),
+    ]);
+    await signIn(mock, a);
+    await b.renew();
+    expect(b).toBe(a);
+    expect(store.state()["accountToken"]).toBe(mock.issuedSecrets[0]);
+  });
 });
 
 describe("Session renew", () => {
@@ -128,6 +140,27 @@ describe("Session renew", () => {
     expect(session.sessionId).toBe("ses-2");
     const forms = mock.callsTo(TOKEN_ENDPOINT).map((call) => call.form?.get("session_id"));
     expect(forms).toEqual([null, "ses-1", null]);
+  });
+
+  it("starts a new Session once on account_mismatch", async () => {
+    const { mock, agent, company } = await setup();
+    const session = await agent.session(company, USER_ID);
+    mock.routes.set(TOKEN_ENDPOINT, () => {
+      mock.routes.delete(TOKEN_ENDPOINT);
+      return Response.json({ error: "account_mismatch" }, { status: 400 });
+    });
+    await session.renew();
+    expect(session.sessionId).toBe("ses-2");
+    const forms = mock.callsTo(TOKEN_ENDPOINT).map((call) => call.form?.get("session_id"));
+    expect(forms).toEqual([null, "ses-1", null]);
+  });
+
+  it("refuses a token that is not DPoP-bound", async () => {
+    const { mock, agent, company } = await setup();
+    mock.routes.set(TOKEN_ENDPOINT, () =>
+      Response.json({ access_token: "at-x", token_type: "Bearer", expires_in: 60 }),
+    );
+    await expect(agent.session(company, USER_ID)).rejects.toThrow(/DPoP/);
   });
 
   it("exposes Retry-After on 429", async () => {
@@ -204,6 +237,16 @@ describe("Session.fetch", () => {
     );
     expect((await session.fetch(`${API}/moved`)).status).toBe(302);
     expect(mock.calls.at(-1)?.url).toBe(`${API}/moved`);
+  });
+
+  it("sends to a host that poppy.json lists as an API", async () => {
+    const mock = await MockCompany.create();
+    mock.poppy = { ...mock.poppy, apis: [{ type: "openapi", url: "https://api.example.net/o" }] };
+    const company = await mock.agent().discover("example.com");
+    const session = await mock.agent().session(company, USER_ID);
+    await session.fetch("https://api.example.net/orders");
+    expect(mock.calls.at(-1)?.url).toBe("https://api.example.net/orders");
+    await expect(session.fetch("https://sub.api.example.net/orders")).rejects.toThrow(/not a host/);
   });
 });
 
@@ -319,6 +362,34 @@ describe("Device Sign-In", () => {
     await expect(session.startDeviceSignIn("")).rejects.toMatchObject({ error: "invalid_scope" });
     expect(mock.callsTo(DEVICE_ENDPOINT)).toHaveLength(0);
   });
+
+  it("refuses an http verification_uri", async () => {
+    const { mock, agent, company } = await setup();
+    const session = await agent.session(company, USER_ID);
+    mock.routes.set(DEVICE_ENDPOINT, () =>
+      Response.json({
+        device_code: "dc-secret-1",
+        user_code: "WDJB-MJHT",
+        verification_uri: "http://example.com/device",
+        expires_in: 600,
+      }),
+    );
+    await expect(session.startDeviceSignIn("poppy:read")).rejects.toThrow(/https/);
+  });
+
+  it("forgets the Session when the User signed in to a different account", async () => {
+    const { mock, agent, company, store } = await setup();
+    mock.devicePolls = ["account_mismatch"];
+    const session = await agent.session(company, USER_ID);
+    vi.useFakeTimers({ toFake: ["setTimeout"] });
+    const done = (await session.startDeviceSignIn("poppy:read")).wait();
+    const assertion = expect(done).rejects.toMatchObject({ error: "account_mismatch" });
+    await vi.advanceTimersByTimeAsync(5_000);
+    await assertion;
+    expect(session.sessionId).toBeUndefined();
+    expect(store.state()).not.toHaveProperty("sessionId");
+    expect(session.signedIn).toBe(false);
+  });
 });
 
 describe("signed-in renew and sign-out", () => {
@@ -366,6 +437,61 @@ describe("signed-in renew and sign-out", () => {
     const { mock, agent, company } = await setup();
     await (await agent.session(company, USER_ID)).signOut();
     expect(mock.callsTo(REVOCATION_ENDPOINT)).toHaveLength(0);
+  });
+
+  it("uses the new Account Token after the Company rotates it", async () => {
+    const { mock, agent, company, store } = await setup();
+    const session = await agent.session(company, USER_ID);
+    await signIn(mock, session);
+    mock.rotateRefresh = true;
+    await session.renew();
+    const rotated = mock.issuedSecrets[1];
+    expect(store.state()["accountToken"]).toBe(rotated);
+    await session.renew();
+    expect(mock.callsTo(TOKEN_ENDPOINT).at(-1)?.form?.get("refresh_token")).toBe(rotated);
+    expect(session.signedIn).toBe(true);
+  });
+
+  it("keeps the Account Token when revocation fails", async () => {
+    const { mock, agent, company, store } = await setup();
+    const session = await agent.session(company, USER_ID);
+    await signIn(mock, session);
+    mock.routes.set(REVOCATION_ENDPOINT, () => new Response(null, { status: 503 }));
+    await expect(session.signOut()).rejects.toMatchObject({ status: 503 });
+    expect(session.signedIn).toBe(true);
+    expect(store.state()["accountToken"]).toBe(mock.issuedSecrets[0]);
+  });
+
+  it("signs out after a refresh in flight lands, not before", async () => {
+    const { mock, company, store } = await setup();
+    let release = () => {};
+    const held = new Promise<void>((resolve) => (release = resolve));
+    let refreshing = () => {};
+    const refreshHeld = new Promise<void>((resolve) => (refreshing = resolve));
+    const { fetch } = mock;
+    mock.fetch = async (input, init) => {
+      const response = await fetch(input, init);
+      if (
+        init?.body instanceof URLSearchParams &&
+        init.body.get("grant_type") === "refresh_token"
+      ) {
+        refreshing();
+        await held;
+      }
+      return response;
+    };
+    const session = await mock.agent({ store }).session(company, USER_ID);
+    await signIn(mock, session);
+    const renewing = session.renew();
+    await refreshHeld;
+    const signingOut = session.signOut();
+    // Give a sign-out that does not wait for the refresh time to revoke first.
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    release();
+    await Promise.all([renewing, signingOut]);
+    expect(session.signedIn).toBe(false);
+    expect(store.state()).not.toHaveProperty("accountToken");
+    expect(mock.callsTo(REVOCATION_ENDPOINT)).toHaveLength(1);
   });
 });
 

@@ -30,7 +30,12 @@ export interface Call {
   at: number;
 }
 
-type DevicePoll = "authorization_pending" | "slow_down" | "access_denied" | "approve";
+type DevicePoll =
+  | "authorization_pending"
+  | "slow_down"
+  | "access_denied"
+  | "account_mismatch"
+  | "approve";
 
 interface Decoded {
   header: Record<string, unknown>;
@@ -121,6 +126,8 @@ export class MockCompany {
   /** Polls answered in order; the last one repeats. */
   devicePolls: DevicePoll[] = ["approve"];
   grantedScope: string | undefined;
+  /** Issue a new refresh token on every refresh and retire the old one. */
+  rotateRefresh = false;
   /** Session IDs the Company considers ended. */
   readonly endedSessions = new Set<string>();
   /** Refresh tokens that answer `invalid_grant`. */
@@ -309,7 +316,14 @@ export class MockCompany {
         if (!this.#refreshTokens.has(token) || this.revokedRefresh.has(token)) {
           return oauthError("invalid_grant");
         }
-        return this.#issue(jkt, true, sessionId, { scope: this.grantedScope ?? "poppy:read" });
+        if (!this.rotateRefresh) {
+          return this.#issue(jkt, true, sessionId, { scope: this.grantedScope ?? "poppy:read" });
+        }
+        this.#refreshTokens.delete(token);
+        return this.#issue(jkt, true, sessionId, {
+          scope: this.grantedScope ?? "poppy:read",
+          refresh_token: this.#newRefresh(sessionId),
+        });
       }
       case "urn:ietf:params:oauth:grant-type:device_code":
         return this.#deviceGrant(params, jkt, sessionId);

@@ -6,6 +6,7 @@
 export interface Store {
   get(key: string): Promise<string | undefined>;
   set(key: string, value: string): Promise<void>;
+  /** Not called by the SDK. Callers use it to forget a User; see the README for the key format. */
   delete(key: string): Promise<void>;
 }
 

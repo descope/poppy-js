@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { discover, isAllowedHost, metadataUrl, PoppyProtocolError } from "../src/index.ts";
+import { isAllowedHost, metadataUrl } from "../src/discovery.ts";
+import { discover, PoppyProtocolError } from "../src/index.ts";
 import { ISSUER, METADATA_URL, MockCompany, TOKEN_ENDPOINT, WEBSITE } from "./mock-company.ts";
 
 const POPPY_URL = `${WEBSITE}/.well-known/poppy.json`;
@@ -129,5 +130,28 @@ describe("isAllowedHost", () => {
     expect(isAllowedHost(company, "a.b.example.com")).toBe(true);
     expect(isAllowedHost(company, "evilexample.com")).toBe(false);
     expect(isAllowedHost(company, "example.com.evil.org")).toBe(false);
+  });
+
+  it("allows other hosts only when poppy.json lists them as an API or poppy endpoint", async () => {
+    const mock = await MockCompany.create();
+    mock.poppy = {
+      ...mock.poppy,
+      apis: [
+        { type: "openapi", url: "https://api.example.net/openapi.json" },
+        { type: "future", url: "http://ignored.example.org" },
+      ],
+      agent: {
+        protocols: [
+          { type: "poppy", endpoint: "https://chat.example.io/poppy" },
+          { type: "future", endpoint: "http://other.example.org" },
+        ],
+      },
+    };
+    const company = await discover("example.com", { fetch: mock.fetch });
+    expect(isAllowedHost(company, "api.example.net")).toBe(true);
+    expect(isAllowedHost(company, "chat.example.io")).toBe(true);
+    expect(isAllowedHost(company, "sub.api.example.net")).toBe(false);
+    expect(isAllowedHost(company, "ignored.example.org")).toBe(false);
+    expect(isAllowedHost(company, "other.example.org")).toBe(false);
   });
 });

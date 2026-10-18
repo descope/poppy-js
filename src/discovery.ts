@@ -22,12 +22,9 @@ export interface Company {
   deviceAuthorizationEndpoint: string | undefined;
   /** Scopes Device Sign-In can grant, or undefined when the Company does not offer it. */
   deviceScopes: readonly string[] | undefined;
-  customScopes: Readonly<Record<string, string>>;
   apis: readonly Api[];
   /** Hosts an authenticated request may go to: the domain's own hosts plus every API and Company Agent host. */
   allowedHosts: readonly string[];
-  /** The poppy.json document as published, for fields this client does not model. */
-  document: Record<string, unknown>;
 }
 
 function string(value: unknown, what: string): string {
@@ -131,7 +128,6 @@ export async function discover(website: string, options: { fetch?: Fetch } = {})
     throw new PoppyProtocolError("dpop_signing_alg_values_supported must include ES256");
 
   const apis = parseApis(doc["apis"]);
-  const customScopes = isObject(auth["custom_scopes"]) ? auth["custom_scopes"] : {};
   return {
     domain,
     name: typeof organization["name"] === "string" ? organization["name"] : domain,
@@ -143,9 +139,6 @@ export async function discover(website: string, options: { fetch?: Fetch } = {})
         ? undefined
         : httpsUrl(metadata["device_authorization_endpoint"], "device_authorization_endpoint").href,
     deviceScopes,
-    customScopes: Object.fromEntries(
-      Object.entries(customScopes).filter(([, v]) => typeof v === "string"),
-    ) as Record<string, string>,
     apis,
     allowedHosts: [
       ...new Set([
@@ -154,7 +147,6 @@ export async function discover(website: string, options: { fetch?: Fetch } = {})
         ...agentHosts(doc["agent"]),
       ]),
     ],
-    document: doc,
   };
 }
 

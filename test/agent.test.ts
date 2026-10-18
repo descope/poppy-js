@@ -725,10 +725,10 @@ describe("forget", () => {
 
   it("does not quote unreadable stored state in the error", async () => {
     const { agent, company, store } = await setup();
-    await store.set(`poppy:${CLIENT_ID}:${ISSUER}:${USER_ID}`, '{"accountToken":"rt-secret');
+    await store.set(`poppy:${CLIENT_ID}:${ISSUER}:${USER_ID}`, "rt-secret garbage");
     const error = await agent.session(company, USER_ID).catch((e: unknown) => e);
     expect(error).toBeInstanceOf(PoppyProtocolError);
-    expect(String(error)).not.toContain("rt-secret");
+    expect(inspect(error, { depth: 10 })).not.toContain("rt-secret");
   });
 
   it("does not write the state back from a renew queued behind the sign-out", async () => {

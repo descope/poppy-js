@@ -222,6 +222,38 @@ describe("Device Sign-In", () => {
     expect((await (await session.fetch(`${API}/a`)).json()).signedIn).toBe(true);
   });
 
+  it("is not overwritten by a signed-out renew that lands after it", async () => {
+    const { mock, company, store } = await setup();
+    let release = () => {};
+    const held = new Promise<void>((resolve) => (release = resolve));
+    let polled = () => {};
+    const approved = new Promise<void>((resolve) => (polled = resolve));
+    let holding = false;
+    const { fetch } = mock;
+    mock.fetch = async (input, init) => {
+      const response = await fetch(input, init);
+      const grantType = init?.body instanceof URLSearchParams && init.body.get("grant_type");
+      if (holding && grantType === "urn:ietf:params:oauth:grant-type:jwt-bearer") await held;
+      if (grantType === "urn:ietf:params:oauth:grant-type:device_code") polled();
+      return response;
+    };
+    const session = await mock.agent({ store }).session(company, USER_ID);
+    vi.useFakeTimers({ toFake: ["setTimeout"] });
+    const done = (await session.startDeviceSignIn("poppy:read")).wait();
+    holding = true;
+    const renewing = session.renew();
+    await vi.advanceTimersByTimeAsync(5_000);
+    vi.useRealTimers();
+    await approved;
+    // Let the approved poll reach its completion step before the held renew lands.
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    release();
+    await Promise.all([renewing, done]);
+    expect(session.signedIn).toBe(true);
+    expect(store.state()["accountToken"]).toBe(mock.issuedSecrets[0]);
+    expect((await (await session.fetch(`${API}/a`)).json()).signedIn).toBe(true);
+  });
+
   it("returns a partial grant instead of failing", async () => {
     const { mock, agent, company } = await setup();
     mock.grantedScope = "poppy:read";

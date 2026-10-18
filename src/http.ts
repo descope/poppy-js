@@ -1,5 +1,6 @@
 import { PoppyProtocolError } from "./errors.ts";
 
+/** A `fetch` implementation, such as the global one or a test double. */
 export type Fetch = typeof fetch;
 
 const MAX_REDIRECTS = 5;

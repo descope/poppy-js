@@ -22,6 +22,7 @@ export interface SigningKey {
   kid: string;
 }
 
+/** Options for {@link PoppyAgent}. */
 export interface PoppyAgentOptions {
   /** The agent's `client_id`: the HTTPS URL of its client metadata document (spec 4.1). */
   clientId: string;
@@ -580,6 +581,7 @@ export class Session {
   }
 }
 
+/** What to show the User for a pending {@link DeviceSignIn} (RFC 8628 section 3.2). */
 export interface DeviceSignInDetails {
   userCode: string;
   verificationUri: string;

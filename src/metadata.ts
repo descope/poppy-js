@@ -2,6 +2,7 @@ import { PoppyProtocolError } from "./errors.ts";
 import { httpsUrl } from "./http.ts";
 import { publicJwk } from "./jose.ts";
 
+/** What {@link clientMetadata} puts in the agent's client metadata document. */
 export interface ClientMetadataInput {
   /** The HTTPS URL this document is served from. */
   clientId: string;

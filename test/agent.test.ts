@@ -55,6 +55,19 @@ function grant(mock: MockCompany): (string | null)[] {
   return mock.callsTo(TOKEN_ENDPOINT).map((call) => call.form?.get("grant_type") ?? null);
 }
 
+/** Drops `fields` from the token responses to `grantType`, as a Company may. */
+function omitFromGrant(mock: MockCompany, grantType: string, fields: string[]) {
+  const { fetch } = mock;
+  mock.fetch = async (input, init) => {
+    const response = await fetch(input, init);
+    if (!(init?.body instanceof URLSearchParams) || init.body.get("grant_type") !== grantType)
+      return response;
+    const body = (await response.json()) as Record<string, unknown>;
+    for (const field of fields) delete body[field];
+    return Response.json(body, { status: response.status, headers: response.headers });
+  };
+}
+
 afterEach(() => {
   vi.useRealTimers();
 });
@@ -304,6 +317,14 @@ describe("Device Sign-In", () => {
     expect((await signIn(mock, session)).result.scope).toBe("poppy:read");
   });
 
+  it("returns the requested scopes when the Company omits scope", async () => {
+    const { mock, company, store } = await setup();
+    omitFromGrant(mock, "urn:ietf:params:oauth:grant-type:device_code", ["scope"]);
+    const session = await mock.agent({ store }).session(company, USER_ID);
+    expect((await signIn(mock, session)).result.scope).toBe("poppy:read poppy:write");
+    expect(session.scope).toBe("poppy:read poppy:write");
+  });
+
   it("waits the interval, and 5 seconds more after slow_down", async () => {
     const { mock, agent, company } = await setup();
     mock.devicePolls = ["authorization_pending", "slow_down", "approve"];
@@ -405,6 +426,28 @@ describe("signed-in renew and sign-out", () => {
     expect(session.signedIn).toBe(true);
   });
 
+  it("keeps the previous scope when a refresh omits scope", async () => {
+    const { mock, company, store } = await setup();
+    omitFromGrant(mock, "refresh_token", ["scope"]);
+    const session = await mock.agent({ store }).session(company, USER_ID);
+    await signIn(mock, session);
+    await session.renew();
+    expect(grant(mock).at(-1)).toBe("refresh_token");
+    expect(session.scope).toBe("poppy:read poppy:write");
+  });
+
+  it("is empty after a Session assertion that omits scope", async () => {
+    const { mock, company, store } = await setup();
+    omitFromGrant(mock, "urn:ietf:params:oauth:grant-type:device_code", ["refresh_token"]);
+    omitFromGrant(mock, "urn:ietf:params:oauth:grant-type:jwt-bearer", ["scope"]);
+    const session = await mock.agent({ store }).session(company, USER_ID);
+    await signIn(mock, session);
+    expect(session.scope).toBe("poppy:read poppy:write");
+    await session.renew();
+    expect(grant(mock).at(-1)).toBe("urn:ietf:params:oauth:grant-type:jwt-bearer");
+    expect(session.scope).toBe("");
+  });
+
   it("continues signed out when the Account Token is no longer valid", async () => {
     const { mock, agent, company, store } = await setup();
     const session = await agent.session(company, USER_ID);
@@ -492,6 +535,33 @@ describe("signed-in renew and sign-out", () => {
     expect(session.signedIn).toBe(false);
     expect(store.state()).not.toHaveProperty("accountToken");
     expect(mock.callsTo(REVOCATION_ENDPOINT)).toHaveLength(1);
+  });
+
+  it("renews signed out when the renew starts during sign-out", async () => {
+    const { mock, company, store } = await setup();
+    let release = () => {};
+    const held = new Promise<void>((resolve) => (release = resolve));
+    let revoking = () => {};
+    const revokeHeld = new Promise<void>((resolve) => (revoking = resolve));
+    const { fetch } = mock;
+    mock.fetch = async (input, init) => {
+      if (String(input) === REVOCATION_ENDPOINT) {
+        revoking();
+        await held;
+      }
+      return fetch(input, init);
+    };
+    const session = await mock.agent({ store }).session(company, USER_ID);
+    await signIn(mock, session);
+    const signingOut = session.signOut();
+    await revokeHeld;
+    const renewing = session.renew();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    release();
+    await Promise.all([signingOut, renewing]);
+    expect(grant(mock).at(-1)).toBe("urn:ietf:params:oauth:grant-type:jwt-bearer");
+    expect(session.signedIn).toBe(false);
+    expect(store.state()).not.toHaveProperty("accountToken");
   });
 });
 

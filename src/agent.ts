@@ -40,7 +40,7 @@ interface PersistedState {
 interface TokenResponse {
   accessToken: string;
   expiresIn: number;
-  scope: string;
+  scope: string | undefined;
   sessionId: string | undefined;
   signedIn: boolean | undefined;
   refreshToken: string | undefined;
@@ -60,7 +60,7 @@ function parseTokenResponse(body: unknown): TokenResponse {
   return {
     accessToken: access_token,
     expiresIn: expires_in,
-    scope: typeof scope === "string" ? scope : "",
+    scope: typeof scope === "string" ? scope : undefined,
     sessionId: typeof session_id === "string" ? session_id : undefined,
     signedIn: typeof signed_in === "boolean" ? signed_in : undefined,
     refreshToken: typeof refresh_token === "string" ? refresh_token : undefined,
@@ -179,6 +179,7 @@ export class Session {
   #expiresAt = 0;
   #signedIn = false;
   #renewing: Promise<void> | undefined;
+  #queue: Promise<unknown> = Promise.resolve();
   readonly #nonces = new Map<string, string>();
 
   constructor(init: SessionInit) {
@@ -206,7 +207,7 @@ export class Session {
    * assertion (4.2). Concurrent calls share one request.
    */
   renew(): Promise<void> {
-    this.#renewing ??= this.#renew().finally(() => {
+    this.#renewing ??= this.#serial(() => this.#renew()).finally(() => {
       this.#renewing = undefined;
     });
     return this.#renewing;
@@ -215,7 +216,7 @@ export class Session {
   async #renew(): Promise<void> {
     if (this.#state.accountToken !== undefined) {
       try {
-        await this.#renewWith(() => this.#refreshParams());
+        await this.#renewWith(() => this.#refreshParams(), this.#state.scope ?? "");
         return;
       } catch (error) {
         if (!(error instanceof PoppyError) || error.error !== "invalid_grant") throw error;
@@ -223,17 +224,28 @@ export class Session {
         await this.#forgetAccount();
       }
     }
-    await this.#renewWith(() => this.#assertionParams());
+    await this.#renewWith(() => this.#assertionParams(), "");
   }
 
-  async #renewWith(params: () => Promise<Record<string, string>>): Promise<void> {
+  /** Runs `task` after every earlier one settles, so token, sign-out and Session ID writes never interleave. */
+  #serial<T>(task: () => Promise<T>): Promise<T> {
+    const run = this.#queue.then(task, task);
+    this.#queue = run.catch(() => undefined);
+    return run;
+  }
+
+  /** `fallbackScope` is the scope to keep when the Company's response omits `scope` (RFC 6749 section 5.1). */
+  async #renewWith(
+    params: () => Promise<Record<string, string>>,
+    fallbackScope: string,
+  ): Promise<void> {
     try {
-      await this.#applyToken(await this.#tokenRequest(params));
+      await this.#applyToken(await this.#tokenRequest(params), fallbackScope);
     } catch (error) {
       const ended = error instanceof PoppyError && SESSION_ENDED.has(error.error);
       if (!ended || this.#state.sessionId === undefined) throw error;
       await this.#persist({ ...this.#state, sessionId: undefined });
-      await this.#applyToken(await this.#tokenRequest(params));
+      await this.#applyToken(await this.#tokenRequest(params), fallbackScope);
     }
   }
 
@@ -320,17 +332,18 @@ export class Session {
     }
   }
 
-  async #applyToken(token: TokenResponse): Promise<void> {
+  async #applyToken(token: TokenResponse, fallbackScope: string): Promise<string> {
     const next: PersistedState = {
       ...this.#state,
       sessionId: token.sessionId ?? this.#state.sessionId,
-      scope: token.scope,
+      scope: token.scope ?? fallbackScope,
       ...(token.refreshToken === undefined ? {} : { accountToken: token.refreshToken }),
     };
     await this.#persist(next);
     this.#accessToken = token.accessToken;
     this.#expiresAt = Date.now() + token.expiresIn * 1000;
     this.#signedIn = token.signedIn ?? next.accountToken !== undefined;
+    return next.scope ?? "";
   }
 
   async #persist(state: PersistedState): Promise<void> {
@@ -472,16 +485,12 @@ export class Session {
         } catch (error) {
           // Spec 4.4: this Session cannot be signed in; the User signs in again in a new Session.
           if (error instanceof PoppyError && SESSION_ENDED.has(error.error)) {
-            await this.#persist({ ...this.#state, sessionId: undefined });
+            await this.#serial(() => this.#persist({ ...this.#state, sessionId: undefined }));
           }
           throw error;
         }
       },
-      async (token) => {
-        // A signed-out renew still in flight must not land after, and overwrite, the signed-in token.
-        await this.#renewing?.catch(() => undefined);
-        await this.#applyToken(token);
-      },
+      (token) => this.#serial(() => this.#applyToken(token, requested.join(" "))),
     );
   }
 
@@ -489,9 +498,11 @@ export class Session {
    * Signs out: revokes the Account Token (spec 4.9). The Session continues signed out.
    * Does nothing when not signed in.
    */
-  async signOut(): Promise<void> {
-    // A refresh in flight could rotate the Account Token, or land a signed-in token after the revoke.
-    await this.#renewing?.catch(() => undefined);
+  signOut(): Promise<void> {
+    return this.#serial(() => this.#signOut());
+  }
+
+  async #signOut(): Promise<void> {
     const token = this.#state.accountToken;
     if (token === undefined) return;
     const body = new URLSearchParams({
@@ -524,14 +535,14 @@ export class DeviceSignIn {
   #interval: number;
   readonly #deviceCode: string;
   readonly #poll: (deviceCode: string) => Promise<TokenResponse>;
-  readonly #complete: (token: TokenResponse) => Promise<void>;
+  readonly #complete: (token: TokenResponse) => Promise<string>;
   readonly #deadline: number;
 
   constructor(
     details: DeviceSignInDetails,
     deviceCode: string,
     poll: (deviceCode: string) => Promise<TokenResponse>,
-    complete: (token: TokenResponse) => Promise<void>,
+    complete: (token: TokenResponse) => Promise<string>,
   ) {
     this.userCode = details.userCode;
     this.verificationUri = details.verificationUri;
@@ -555,8 +566,7 @@ export class DeviceSignIn {
       await sleep(this.#interval * 1000, options.signal);
       try {
         const token = await this.#poll(this.#deviceCode);
-        await this.#complete(token);
-        return { scope: token.scope };
+        return { scope: await this.#complete(token) };
       } catch (error) {
         if (!(error instanceof PoppyError)) throw error;
         if (error.error === "slow_down") this.#interval += 5;

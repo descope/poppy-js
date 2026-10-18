@@ -9,7 +9,7 @@
  *   POPPY_USER_ID            The opaque ID the agent uses for this User at this Company.
  *   POPPY_API_URL            An API URL to call, on the Company's domain or listed in its poppy.json.
  *
- * Run: node examples/device-sign-in.ts
+ * Run: node examples/device-sign-in.ts (Node.js 22.18 or later runs TypeScript directly)
  */
 import { PoppyAgent } from "../src/index.ts";
 

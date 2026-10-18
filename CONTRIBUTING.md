@@ -4,7 +4,7 @@ Thanks for helping. Bug reports, fixes and spec-conformance improvements are wel
 
 ## Setup
 
-You need Node.js 22 or later and pnpm (the version is pinned in `package.json`; `corepack enable` picks it up).
+You need Node.js 22.12 or later (for the dev tools) and pnpm (the version is pinned in `package.json`; `corepack enable` picks it up).
 
 ```sh
 pnpm install

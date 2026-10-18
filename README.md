@@ -137,6 +137,10 @@ These parts of the spec are not in this release:
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). This project follows a [Code of Conduct](CODE_OF_CONDUCT.md).
 
+## Contact Us
+
+If you need help you can email [Descope Support](mailto:support@descope.com)
+
 ## License
 
 [Apache-2.0](LICENSE)

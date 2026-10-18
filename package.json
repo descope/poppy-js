@@ -9,7 +9,16 @@
     "personal-agent",
     "poppy"
   ],
+  "homepage": "https://github.com/descope/poppy-js#readme",
+  "bugs": {
+    "url": "https://github.com/descope/poppy-js/issues"
+  },
   "license": "Apache-2.0",
+  "author": "Descope",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/descope/poppy-js.git"
+  },
   "files": [
     "dist"
   ],
@@ -18,8 +27,13 @@
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
-      "import": "./dist/index.js"
-    }
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",

@@ -557,6 +557,15 @@ describe("signed-in renew and sign-out", () => {
     );
   });
 
+  it("is signed out after a revocation whose store write failed", async () => {
+    const { mock, agent, company, store } = await setup();
+    const session = await agent.session(company, USER_ID);
+    await signIn(mock, session);
+    store.set = () => Promise.reject(new Error("disk full"));
+    await expect(session.signOut()).rejects.toThrow("disk full");
+    expect(session.signedIn).toBe(false);
+  });
+
   it("keeps the Account Token when revocation fails", async () => {
     const { mock, agent, company, store } = await setup();
     const session = await agent.session(company, USER_ID);
@@ -712,6 +721,14 @@ describe("forget", () => {
     await store.set(`poppy:${CLIENT_ID}:${ISSUER}:${USER_ID}`, "not json");
     await agent.forget(company, USER_ID);
     expect(store.values.size).toBe(0);
+  });
+
+  it("does not quote unreadable stored state in the error", async () => {
+    const { agent, company, store } = await setup();
+    await store.set(`poppy:${CLIENT_ID}:${ISSUER}:${USER_ID}`, '{"accountToken":"rt-secret');
+    const error = await agent.session(company, USER_ID).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(PoppyProtocolError);
+    expect(String(error)).not.toContain("rt-secret");
   });
 
   it("does not write the state back from a renew queued behind the sign-out", async () => {

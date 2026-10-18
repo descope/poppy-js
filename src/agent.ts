@@ -202,7 +202,12 @@ export class PoppyAgent {
       state = { dpopKey: generated.exported };
       await this.#store.set(storeKey, JSON.stringify(state));
     } else {
-      state = JSON.parse(stored) as PersistedState;
+      try {
+        state = JSON.parse(stored) as PersistedState;
+      } catch {
+        // V8's SyntaxError quotes the input, which holds the Account Token and DPoP private key.
+        throw new PoppyProtocolError("stored state is not valid JSON");
+      }
       dpopKey = await DpopKey.fromJwk(state.dpopKey);
     }
     const session = new Session({
@@ -414,10 +419,10 @@ export class Session {
 
   async #forgetAccount(): Promise<void> {
     const { accountToken: _, ...rest } = this.#state;
-    await this.#persist({ ...rest, scope: "" });
     this.#accessToken = undefined;
     this.#expiresAt = 0;
     this.#signedIn = false;
+    await this.#persist({ ...rest, scope: "" });
   }
 
   async #currentToken(): Promise<string> {

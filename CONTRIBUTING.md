@@ -30,6 +30,15 @@ CI runs the same checks on Node.js 22, 24 and 26.
 - **Keep secrets out of errors and logs.** Tokens, device codes and assertions live in private fields and never appear in error messages.
 - **One change per pull request**, with a commit message in the imperative mood.
 
+## Releases
+
+[release-please](https://github.com/googleapis/release-please) reads the Conventional Commit messages on `main` (`feat:`, `fix:`, `feat!:`) and keeps a release pull request open with the next version and changelog. Merging that pull request tags the release, and `.github/workflows/release.yml` then publishes to npm with provenance. Nothing is published on other pushes.
+
+The workflow needs these repository secrets:
+
+- `RELEASE_APP_ID` and `RELEASE_APP_PEM`: the GitHub App that opens the release pull request.
+- `NPM_TOKEN`: an npm granular access token with publish rights on `@descope/poppy`. Not needed if npm trusted publishing (OIDC) is set up for this repository instead.
+
 ## Reporting security issues
 
 See [SECURITY.md](SECURITY.md). Do not open public issues for vulnerabilities.

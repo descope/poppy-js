@@ -1,6 +1,5 @@
 import { ES256, nowSeconds, publicJwk, randomId, sha256, signJwt } from "./jose.ts";
 
-/** A DPoP key pair (spec 4.3). One per User per Company; never published. */
 export class DpopKey {
   readonly #privateKey: CryptoKey;
   readonly #jwk: JsonWebKey;
@@ -22,7 +21,7 @@ export class DpopKey {
     return new DpopKey(privateKey, { kty, crv, x, y } as JsonWebKey);
   }
 
-  /** Builds a proof for one request. `htu` drops the query and fragment (RFC 9449 4.2). */
+  /** `htu` drops the query and fragment (RFC 9449 4.2). */
   async proof(
     method: string,
     url: string,

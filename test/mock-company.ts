@@ -2,11 +2,10 @@ import { expect } from "vitest";
 import { PoppyAgent, type SigningKey, type Store } from "../src/index.ts";
 
 /**
- * An in-memory Company that checks what the spec makes a Company check: ES256 signatures on both assertions and
- * every DPoP Proof, `aud` equal to the issuer, single-use `jti`, DPoP `htm`/`htu`/`ath`/`nonce`, and tokens bound
- * to the DPoP key's RFC 7638 thumbprint. Tests drive it through an injected `fetch`.
+ * In-memory Company that enforces what the spec requires of one: ES256 signatures on assertions and DPoP
+ * Proofs, `aud` equal to the issuer, single-use `jti`, DPoP `htm`/`htu`/`ath`/`nonce`, and tokens bound to the
+ * RFC 7638 thumbprint.
  */
-
 export const WEBSITE = "https://example.com";
 export const ISSUER = "https://auth.example.com/tenants/t1";
 export const METADATA_URL =
@@ -87,7 +86,6 @@ async function sha256(value: string): Promise<string> {
   return Buffer.from(digest).toString("base64url");
 }
 
-/** RFC 7638 thumbprint of a P-256 public JWK. */
 export function thumbprint(jwk: JsonWebKey): Promise<string> {
   return sha256(JSON.stringify({ crv: jwk.crv, kty: jwk.kty, x: jwk.x, y: jwk.y }));
 }
@@ -114,7 +112,7 @@ export class MockCompany {
   readonly signingKey: SigningKey;
   readonly #publicKey: CryptoKey;
 
-  /** Overrides for the documents and redirects served, keyed by URL. */
+  /** Overrides for served documents and redirects, by URL. */
   readonly routes = new Map<string, () => Response>();
   poppy = poppyJson();
   metadata = oauthMetadata();
@@ -126,7 +124,6 @@ export class MockCompany {
   /** Polls answered in order; the last one repeats. */
   devicePolls: DevicePoll[] = ["approve"];
   grantedScope: string | undefined;
-  /** Issue a new refresh token on every refresh and retire the old one. */
   rotateRefresh = false;
   readonly endedSessions = new Set<string>();
   /** Refresh tokens that answer `invalid_grant`. */
@@ -241,7 +238,6 @@ export class MockCompany {
     return `nonce-${this.#nonceCounter}`;
   }
 
-  /** Verifies a DPoP Proof and returns the key's thumbprint. */
   async #dpop(
     headers: Headers,
     method: string,

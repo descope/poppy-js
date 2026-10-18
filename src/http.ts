@@ -1,6 +1,5 @@
 import { PoppyProtocolError } from "./errors.ts";
 
-/** A `fetch` implementation, such as the global one or a test double. */
 export type Fetch = typeof fetch;
 
 const MAX_REDIRECTS = 5;
@@ -17,7 +16,7 @@ export function httpsUrl(value: unknown, what: string): URL {
   return url;
 }
 
-/** Fetches a JSON document, following up to five redirects, each of which must stay on https (spec 3). */
+/** Follows up to five redirects, each of which must stay on https (spec 3). */
 export async function getJson(
   fetchFn: Fetch,
   url: URL,
@@ -45,7 +44,7 @@ export async function getJson(
   throw new PoppyProtocolError(`${what} redirected more than ${MAX_REDIRECTS} times`);
 }
 
-/** Posts a form. Never follows redirects, so credentials in the body stay at the endpoint they were meant for. */
+/** Never follows redirects, so credentials in the body stay at their endpoint. */
 export function postForm(
   fetchFn: Fetch,
   url: string,

@@ -1,7 +1,6 @@
 /**
- * Where a {@link PoppyAgent} keeps per-User state: the DPoP private key, the Session ID and the Account Token.
- *
- * Values are secrets (spec 4.8). Back this with encrypted storage in production.
+ * Holds per-User state: the DPoP private key, Session ID and Account Token.
+ * Values are secrets (spec 4.8), so use encrypted storage in production.
  */
 export interface Store {
   get(key: string): Promise<string | undefined>;
@@ -10,7 +9,7 @@ export interface Store {
   delete(key: string): Promise<void>;
 }
 
-/** Keeps state in process memory. State is lost on exit, so every restart starts new Sessions. */
+/** State is lost on exit, so every restart starts new Sessions. */
 export class MemoryStore implements Store {
   readonly #values = new Map<string, string>();
 

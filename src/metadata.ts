@@ -2,7 +2,6 @@ import { PoppyProtocolError } from "./errors.ts";
 import { httpsUrl } from "./http.ts";
 import { publicJwk } from "./jose.ts";
 
-/** What {@link clientMetadata} puts in the agent's client metadata document. */
 export interface ClientMetadataInput {
   /** The HTTPS URL this document is served from. */
   clientId: string;
@@ -20,8 +19,7 @@ function sameHost(clientId: URL, value: string, what: string): string {
 }
 
 /**
- * Builds the client metadata document the agent publishes at its `client_id` URL (spec 4.1).
- * Serve it as JSON at exactly `clientId`.
+ * Serve the result as JSON at exactly `clientId` (spec 4.1).
  */
 export function clientMetadata(input: ClientMetadataInput): Record<string, unknown> {
   const clientId = httpsUrl(input.clientId, "clientId");
@@ -36,7 +34,7 @@ export function clientMetadata(input: ClientMetadataInput): Record<string, unkno
   };
 }
 
-/** Builds the JSON Web Key Set served at `jwks_uri`. Only public members are included. */
+/** Only public members are included. */
 export async function jwks(
   keys: { publicKey: CryptoKey; kid: string }[],
 ): Promise<{ keys: JsonWebKey[] }> {

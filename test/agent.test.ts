@@ -29,7 +29,6 @@ class InspectableStore implements Store {
   async delete(key: string) {
     this.values.delete(key);
   }
-  /** The single stored Session state. */
   state(): Record<string, unknown> {
     const [value] = this.values.values();
     return JSON.parse(value ?? "{}") as Record<string, unknown>;
@@ -43,7 +42,6 @@ async function setup(store = new InspectableStore()) {
   return { mock, agent, company, store };
 }
 
-/** Runs Device Sign-In to completion under fake timers. */
 async function signIn(mock: MockCompany, session: Session) {
   vi.useFakeTimers({ toFake: ["setTimeout"] });
   const pending = await session.startDeviceSignIn("poppy:read poppy:write");
@@ -57,7 +55,6 @@ function grant(mock: MockCompany): (string | null)[] {
   return mock.callsTo(TOKEN_ENDPOINT).map((call) => call.form?.get("grant_type") ?? null);
 }
 
-/** Drops `fields` from the token responses to `grantType`, as a Company may. */
 function omitFromGrant(mock: MockCompany, grantType: string, fields: string[]) {
   const { fetch } = mock;
   mock.fetch = async (input, init) => {
@@ -303,7 +300,7 @@ describe("Device Sign-In", () => {
     await vi.advanceTimersByTimeAsync(5_000);
     vi.useRealTimers();
     await approved;
-    // Let the approved poll reach its completion step before the held renew lands.
+    // Let the approved poll reach completion before the held renew lands.
     await new Promise((resolve) => setTimeout(resolve, 20));
     release();
     await Promise.all([renewing, done]);

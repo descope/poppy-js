@@ -6,7 +6,6 @@ export function base64url(bytes: ArrayBuffer | Uint8Array): string {
   );
 }
 
-/** A random identifier with 128 bits of entropy (spec 4.2 `jti`). */
 export function randomId(): string {
   return base64url(crypto.getRandomValues(new Uint8Array(16)));
 }
@@ -21,7 +20,7 @@ export const ES256: EcKeyImportParams & EcdsaParams = {
   hash: "SHA-256",
 };
 
-/** Signs a compact JWS with ES256. WebCrypto already returns the raw r||s signature JWS expects. */
+/** WebCrypto already returns the raw r||s signature JWS expects. */
 export async function signJwt(
   header: Record<string, unknown>,
   payload: Record<string, unknown>,

@@ -1,15 +1,13 @@
 /**
- * Starts a Session with a Company, signs the User in with Device Sign-In, calls an API, then signs out.
- *
  * Environment:
- *   POPPY_CLIENT_ID          The agent's client_id: the HTTPS URL of its published client metadata document.
- *   POPPY_AGENT_PRIVATE_JWK  The agent's ES256 private key as a JWK; its public half is in the agent's jwks_uri.
- *   POPPY_AGENT_KID          The key's kid in that key set.
- *   POPPY_WEBSITE            The Company's website, such as example.com.
- *   POPPY_USER_ID            The opaque ID the agent uses for this User at this Company.
- *   POPPY_API_URL            An API URL to call, on the Company's domain or listed in its poppy.json.
+ *   POPPY_CLIENT_ID          HTTPS URL of the agent's client metadata document
+ *   POPPY_AGENT_PRIVATE_JWK  ES256 private key as a JWK
+ *   POPPY_AGENT_KID          kid of its public half in the agent's jwks_uri
+ *   POPPY_WEBSITE            Company website, such as example.com
+ *   POPPY_USER_ID            opaque ID for this User at this Company
+ *   POPPY_API_URL            API on the Company's domain or listed in its poppy.json
  *
- * Run: node examples/device-sign-in.ts (Node.js 22.18 or later runs TypeScript directly)
+ * Run: node examples/device-sign-in.ts (Node.js 22.18 or later)
  */
 import { PoppyAgent } from "../src/index.ts";
 

@@ -1,4 +1,4 @@
-/** OAuth and Poppy error codes a Company may return (spec 4.2, 4.4, 4.6, 4.8, section 6). */
+/** Codes a Company may return (spec 4.2, 4.4, 4.6, 4.8, section 6). Other strings can occur. */
 export type PoppyErrorCode =
   | "invalid_client"
   | "invalid_grant"
@@ -18,10 +18,9 @@ export type PoppyErrorCode =
   | (string & {});
 
 /**
- * An error returned by a Company, or a protocol check that failed on the agent side.
- *
- * Carries only the HTTP status, the OAuth `error` code and `error_description`. It never holds tokens,
- * assertions, device codes or response bodies, so it is safe to log.
+ * An error returned by a Company, or a failed protocol check.
+ * Holds only the HTTP status, `error` and `error_description`, never tokens, assertions, device codes or
+ * response bodies, so it is safe to log.
  */
 export class PoppyError extends Error {
   override readonly name = "PoppyError";
@@ -51,7 +50,7 @@ export class PoppyError extends Error {
   }
 }
 
-/** Raised when a document or response breaks the protocol, before any token is sent. */
+/** Raised when a document or response breaks the protocol. Has no `status`. */
 export class PoppyProtocolError extends PoppyError {
   constructor(description: string) {
     super("protocol_error", { description });

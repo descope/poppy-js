@@ -13,7 +13,7 @@ export interface Api {
 
 /** The parts of a Company's poppy.json and OAuth metadata this client uses, after validation. */
 export interface Company {
-  /** The host that served poppy.json, after redirects. Equals `organization.domain`, ignoring case. */
+  /** The host that served poppy.json, after redirects; equals `organization.domain`. */
   domain: string;
   name: string;
   issuer: string;
@@ -56,7 +56,7 @@ function websiteUrl(website: string): URL {
 
 const KNOWN_API_TYPES = new Set(["openapi", "mcp"]);
 
-/** Keeps the API types this version knows and skips the rest unchecked, so later types can be added (spec 6). */
+/** Unknown API types are skipped unchecked so later types can be added (spec 6). */
 function parseApis(value: unknown): Api[] {
   if (value === undefined) return [];
   if (!Array.isArray(value)) throw new PoppyProtocolError("apis must be a list");
@@ -73,7 +73,6 @@ function parseApis(value: unknown): Api[] {
   return apis;
 }
 
-/** Hosts of the `poppy` conversation endpoints; other protocol types are skipped unchecked (spec 7.1). */
 function agentHosts(agent: unknown): string[] {
   if (!isObject(agent) || !Array.isArray(agent["protocols"])) return [];
   return agent["protocols"].flatMap((protocol, index) =>
@@ -84,10 +83,9 @@ function agentHosts(agent: unknown): string[] {
 }
 
 /**
- * Fetches and checks a Company's poppy.json and its issuer's OAuth metadata (spec 3, 3.2).
- *
- * Throws {@link PoppyProtocolError} when anything fails a check the spec requires, so no token is ever sent to
- * a Company that did not prove it owns the issuer.
+ * Fetches a Company's poppy.json and its issuer's OAuth metadata and checks both (spec 3, 3.2).
+ * Throws {@link PoppyProtocolError} on any failed check, so no token goes to a Company that did not prove it
+ * owns the issuer.
  */
 export async function discover(website: string, options: { fetch?: Fetch } = {}): Promise<Company> {
   const fetchFn = options.fetch ?? fetch;

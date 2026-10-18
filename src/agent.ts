@@ -9,25 +9,23 @@ const JWT_BEARER = "urn:ietf:params:oauth:grant-type:jwt-bearer";
 const DEVICE_CODE = "urn:ietf:params:oauth:grant-type:device_code";
 const CLIENT_ASSERTION_TYPE = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
 const ASSERTION_LIFETIME = 60;
-/** Renew this many seconds before a Session Token expires, so a request never races the expiry. */
 const EXPIRY_MARGIN = 30;
 const SESSION_ENDED = new Set(["invalid_session", "account_mismatch"]);
-/** Sessions whose state {@link PoppyAgent.forget} deleted. They must not write it back or keep using a token. */
+/** Sessions erased by {@link PoppyAgent.forget} must not write state back or use a token. */
 const forgotten = new WeakSet<Session>();
 
-/** The key the agent signs its client and Session assertions with. Its public half is in the agent's `jwks_uri`. */
+/** Signs the agent's client and Session assertions. Publish the public half at `jwks_uri`. */
 export interface SigningKey {
   privateKey: CryptoKey;
-  /** The `kid` of this key in the published key set. */
+  /** Must match this key's `kid` in the published key set. */
   kid: string;
 }
 
-/** Options for {@link PoppyAgent}. */
 export interface PoppyAgentOptions {
-  /** The agent's `client_id`: the HTTPS URL of its client metadata document (spec 4.1). */
+  /** HTTPS URL of the client metadata document, exactly as published (spec 4.1). */
   clientId: string;
   signingKey: SigningKey;
-  /** Defaults to a {@link MemoryStore}. */
+  /** Defaults to {@link MemoryStore}. */
   store?: Store;
   /** Defaults to the global `fetch`. Every request is sent with `redirect: "manual"`. */
   fetch?: Fetch;
@@ -70,7 +68,7 @@ function parseTokenResponse(body: unknown): TokenResponse {
   };
 }
 
-/** The `error` attribute of a response's `WWW-Authenticate` header, such as `sign_in_required` (spec section 6). */
+/** Reads the `error` attribute of `WWW-Authenticate`, such as `sign_in_required` (spec section 6). */
 export function wwwAuthenticateError(response: Response): string | undefined {
   return /\berror="([^"]*)"/.exec(response.headers.get("www-authenticate") ?? "")?.[1];
 }
@@ -90,7 +88,7 @@ function sleep(ms: number, signal: AbortSignal | undefined): Promise<void> {
   });
 }
 
-/** A Personal Agent: holds its identity and opens Sessions with Companies for its Users. */
+/** A Personal Agent. Opens Sessions with Companies for its Users. */
 export class PoppyAgent {
   readonly clientId: string;
   readonly #signingKey: SigningKey;
@@ -98,8 +96,8 @@ export class PoppyAgent {
   readonly #fetch: Fetch;
   readonly #sessions = new Map<string, Promise<Session>>();
   /**
-   * In-flight {@link forget} calls per store key. Opening that User waits for them, so it cannot be erased, and
-   * fails when they fail, so it cannot pick up state that was not deleted.
+   * Opening a User waits for its in-flight {@link forget} and fails if it failed, so it never reuses state
+   * that was not deleted.
    */
   readonly #forgetting = new Map<string, Promise<void>>();
 
@@ -113,21 +111,21 @@ export class PoppyAgent {
     this.#fetch = options.fetch ?? fetch;
   }
 
-  /** Discovers a Company from its website, using this agent's `fetch`. */
+  /** Like {@link discover}, using this agent's `fetch`. */
   discover(website: string): Promise<Company> {
     return discover(website, { fetch: this.#fetch });
   }
 
   /**
-   * Opens the Session for `userId` at `company`, resuming a stored one when there is one.
+   * Opens the Session for `userId` at `company`, resuming a stored one.
    *
-   * `userId` is the opaque ID this agent gives the User for this Company (spec 4.2). It must be stable, differ per
-   * Company, and must not contain or be derived from personal data such as an email, even with a keyed hash.
+   * `userId` is an opaque ID (spec 4.2): stable, different per Company, and never an email or derived from
+   * personal data, even with a keyed hash.
    */
   session(company: Company, userId: string): Promise<Session> {
     if (userId === "") return Promise.reject(new PoppyProtocolError("userId is required"));
     const storeKey = this.#storeKey(company, userId);
-    // One live Session per stored state, so two Sessions never overwrite each other's Account Token.
+    // One Session per stored state, so two never overwrite each other's Account Token.
     let session = this.#sessions.get(storeKey);
     if (session === undefined) {
       const forgetting = this.#forgetting.get(storeKey);
@@ -142,9 +140,9 @@ export class PoppyAgent {
   }
 
   /**
-   * Forgets `userId` at `company`: signs the Session out when it is signed in, then deletes its stored state.
-   * Sessions opened before stop working; the next {@link session} call starts a new, signed-out one.
-   * A failed revocation does not stop the state from being deleted.
+   * Signs the Session out if signed in, then deletes the stored state for `userId` at `company`.
+   * Sessions opened earlier stop working; the next {@link session} call starts a new, signed-out one.
+   * A failed sign-out does not stop the deletion.
    */
   forget(company: Company, userId: string): Promise<void> {
     const storeKey = this.#storeKey(company, userId);
@@ -169,7 +167,7 @@ export class PoppyAgent {
   ): Promise<void> {
     let session = await open?.catch(() => undefined);
     if (open === undefined && (await this.#hasAccountToken(storeKey))) {
-      // Only then: opening a Session without an Account Token would start a new one at the Company.
+      // Without an Account Token there is nothing to revoke; opening a Session would create one.
       session = await this.#openSession(company, userId, storeKey).catch(() => undefined);
     }
     await session?.signOut().catch(() => undefined);
@@ -232,7 +230,7 @@ interface SessionInit {
 
 type FetchBody = Exclude<RequestInit["body"], ReadableStream | null | undefined>;
 
-/** A Session with one Company for one User (spec 4.2). Get one from {@link PoppyAgent.session}. */
+/** Get one from {@link PoppyAgent.session} (spec 4.2). */
 export class Session {
   readonly company: Company;
   readonly #init: SessionInit;
@@ -250,7 +248,7 @@ export class Session {
     this.#state = init.state;
   }
 
-  /** The Session ID. Not a credential. Undefined if the Company did not return one. */
+  /** Not a credential. Undefined if the Company returned none. */
   get sessionId(): string | undefined {
     return this.#state.sessionId;
   }
@@ -259,13 +257,13 @@ export class Session {
     return this.#signedIn;
   }
 
-  /** The account scopes the current Session Token carries, space-separated. Empty when signed out. */
+  /** Space-separated account scopes of the current Session Token. Empty when signed out. */
   get scope(): string {
     return this.#state.scope ?? "";
   }
 
   /**
-   * Gets a new Session Token now: with the Account Token when there is one (spec 4.8), else with a fresh Session
+   * Gets a new Session Token now, using the Account Token if there is one (spec 4.8), else a fresh Session
    * assertion (4.2). Concurrent calls share one request.
    */
   renew(): Promise<void> {
@@ -283,21 +281,21 @@ export class Session {
         return;
       } catch (error) {
         if (!(error instanceof PoppyError) || error.error !== "invalid_grant") throw error;
-        // Spec 4.8: the Account Token expired or was revoked; the Session continues signed out.
+        // Spec 4.8: invalid_grant means the Account Token is gone; continue signed out.
         await this.#forgetAccount();
       }
     }
     await this.#renewWith(() => this.#assertionParams(), "");
   }
 
-  /** Runs `task` after every earlier one settles, so token, sign-out and Session ID writes never interleave. */
+  /** Token, sign-out and Session ID writes must never interleave. */
   #serial<T>(task: () => Promise<T>): Promise<T> {
     const run = this.#queue.then(task, task);
     this.#queue = run.catch(() => undefined);
     return run;
   }
 
-  /** `fallbackScope` is the scope to keep when the Company's response omits `scope` (RFC 6749 section 5.1). */
+  /** Keeps `fallbackScope` when the response omits `scope` (RFC 6749 section 5.1). */
   async #renewWith(
     params: () => Promise<Record<string, string>>,
     fallbackScope: string,
@@ -437,11 +435,9 @@ export class Session {
 
   /**
    * Calls a Company API with the Session Token and a DPoP Proof (spec 4.3, section 6).
-   *
-   * The URL must be https and on the Company's domain, a subdomain of it, or an API or Company Agent host from
-   * poppy.json. Redirects are returned, not followed. Retries once on a DPoP nonce challenge and once on
-   * `invalid_token`. Other 401 and 403 responses are returned for the caller to handle; see
-   * {@link wwwAuthenticateError}.
+   * The URL must be https on the Company's domain, a subdomain, or an API or Company Agent host from poppy.json.
+   * Redirects are returned, not followed. Retries once on a DPoP nonce challenge and once on `invalid_token`.
+   * Other 401 and 403 responses are returned; see {@link wwwAuthenticateError}.
    */
   async fetch(
     input: string | URL,
@@ -497,7 +493,7 @@ export class Session {
    * Starts Device Sign-In (spec 4.6). Show the User `verificationUri` and `userCode`, then call
    * {@link DeviceSignIn.wait}.
    *
-   * @param scope Space-separated scopes the task needs, each from `company.deviceScopes`.
+   * @param scope Space-separated, each from `company.deviceScopes`.
    */
   async startDeviceSignIn(scope: string): Promise<DeviceSignIn> {
     const { deviceAuthorizationEndpoint, deviceScopes } = this.company;
@@ -552,7 +548,7 @@ export class Session {
             ...this.#sessionParam(),
           }));
         } catch (error) {
-          // Spec 4.4: this Session cannot be signed in; the User signs in again in a new Session.
+          // Spec 4.4: this Session ID is dead, so forget it.
           if (error instanceof PoppyError && SESSION_ENDED.has(error.error)) {
             await this.#serial(() => this.#persist({ ...this.#state, sessionId: undefined }));
           }
@@ -564,8 +560,7 @@ export class Session {
   }
 
   /**
-   * Signs out: revokes the Account Token (spec 4.9). The Session continues signed out.
-   * Does nothing when not signed in.
+   * Revokes the Account Token (spec 4.9); the Session continues signed out. No-op when signed out.
    */
   signOut(): Promise<void> {
     return this.#serial(() => this.#signOut());
@@ -596,7 +591,7 @@ export interface DeviceSignInDetails {
   interval: number;
 }
 
-/** A pending Device Sign-In. The device code stays private to this object. */
+/** The device code stays private to this object. */
 export class DeviceSignIn {
   readonly userCode: string;
   readonly verificationUri: string;

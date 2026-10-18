@@ -12,3 +12,4 @@ All notable changes to this project are documented here. The format follows [Kee
 - Device Sign-In with `slow_down` handling, a deadline and `AbortSignal` support.
 - `Session.fetch` for DPoP-bound API calls, limited to the Company's hosts.
 - `Store` interface and `MemoryStore`.
+- `PoppyAgent.forget` to sign a User out at a Company and delete their stored state.

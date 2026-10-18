@@ -565,6 +565,84 @@ describe("signed-in renew and sign-out", () => {
   });
 });
 
+describe("forget", () => {
+  it("signs out, deletes the state, and stops old Session handles", async () => {
+    const { mock, agent, company, store } = await setup();
+    const session = await agent.session(company, USER_ID);
+    await signIn(mock, session);
+    await agent.forget(company, USER_ID);
+    expect(mock.callsTo(REVOCATION_ENDPOINT)[0]?.form?.get("token")).toBe(mock.issuedSecrets[0]);
+    expect(store.values.size).toBe(0);
+    await expect(session.renew()).rejects.toBeInstanceOf(PoppyProtocolError);
+    await expect(session.fetch(`${API}/a`)).rejects.toBeInstanceOf(PoppyProtocolError);
+    expect(store.values.size).toBe(0);
+  });
+
+  it("deletes the state and stops old handles when revocation fails", async () => {
+    const { mock, agent, company, store } = await setup();
+    const session = await agent.session(company, USER_ID);
+    await signIn(mock, session);
+    mock.routes.set(REVOCATION_ENDPOINT, () => new Response(null, { status: 503 }));
+    await agent.forget(company, USER_ID);
+    expect(store.values.size).toBe(0);
+    await expect(session.fetch(`${API}/a`)).rejects.toBeInstanceOf(PoppyProtocolError);
+  });
+
+  it("does not write the state back from a renew queued behind the sign-out", async () => {
+    const { mock, company, store } = await setup();
+    let release = () => {};
+    const held = new Promise<void>((resolve) => (release = resolve));
+    let revoking = () => {};
+    const revokeHeld = new Promise<void>((resolve) => (revoking = resolve));
+    const { fetch } = mock;
+    mock.fetch = async (input, init) => {
+      if (String(input) === REVOCATION_ENDPOINT) {
+        revoking();
+        await held;
+      }
+      return fetch(input, init);
+    };
+    const agent = mock.agent({ store });
+    const session = await agent.session(company, USER_ID);
+    await signIn(mock, session);
+    const forgetting = agent.forget(company, USER_ID);
+    await revokeHeld;
+    const renewing = session.renew().catch((error: unknown) => error);
+    release();
+    await forgetting;
+    expect(await renewing).toBeInstanceOf(PoppyProtocolError);
+    expect(store.values.size).toBe(0);
+  });
+
+  it("starts a new signed-out Session afterwards", async () => {
+    const { mock, agent, company, store } = await setup();
+    const session = await agent.session(company, USER_ID);
+    await signIn(mock, session);
+    await agent.forget(company, USER_ID);
+    const next = await agent.session(company, USER_ID);
+    expect(next).not.toBe(session);
+    expect(next.signedIn).toBe(false);
+    expect(store.state()).not.toHaveProperty("accountToken");
+  });
+
+  it("revokes a stored Account Token without an open Session", async () => {
+    const { mock, agent, company, store } = await setup();
+    await signIn(mock, await agent.session(company, USER_ID));
+    await mock.agent({ store }).forget(company, USER_ID);
+    expect(mock.callsTo(REVOCATION_ENDPOINT)).toHaveLength(1);
+    expect(store.values.size).toBe(0);
+  });
+
+  it("opens no Session when there is no Account Token to revoke", async () => {
+    const { mock, agent, company, store } = await setup();
+    await agent.session(company, USER_ID);
+    const tokenCalls = mock.callsTo(TOKEN_ENDPOINT).length;
+    await mock.agent({ store }).forget(company, USER_ID);
+    expect(mock.callsTo(TOKEN_ENDPOINT)).toHaveLength(tokenCalls);
+    expect(store.values.size).toBe(0);
+  });
+});
+
 describe("secrets", () => {
   it("never appear in errors or inspected objects", async () => {
     const { mock, agent, company } = await setup();

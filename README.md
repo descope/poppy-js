@@ -95,7 +95,7 @@ interface Store {
 
 The default `MemoryStore` loses everything on exit, so every restart starts new Sessions. In production, pass a store backed by encrypted storage. The SDK writes the new state before it uses a token response, so a crash cannot lose an Account Token the Company already rotated.
 
-Use one `PoppyAgent` per store in a process. The agent keeps one live Session per User and Company, but agents or processes that share a store do not coordinate, and can overwrite each other's Account Token. State is stored under the key `poppy:<clientId>:<issuer>:<userId>`; call `store.delete()` with that key to forget a User at a Company.
+Use one `PoppyAgent` per store in a process. The agent keeps one live Session per User and Company, but agents or processes that share a store do not coordinate, and can overwrite each other's Account Token. State is stored under the key `poppy:<clientId>:<issuer>:<userId>`. Call `agent.forget(company, userId)` to sign a User out at a Company and delete their state there.
 
 ## User IDs
 

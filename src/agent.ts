@@ -12,6 +12,8 @@ const ASSERTION_LIFETIME = 60;
 /** Renew this many seconds before a Session Token expires, so a request never races the expiry. */
 const EXPIRY_MARGIN = 30;
 const SESSION_ENDED = new Set(["invalid_session", "account_mismatch"]);
+/** Sessions whose state {@link PoppyAgent.forget} deleted. They must not write it back or keep using a token. */
+const forgotten = new WeakSet<Session>();
 
 /** The key the agent signs its client and Session assertions with. Its public half is in the agent's `jwks_uri`. */
 export interface SigningKey {
@@ -118,7 +120,7 @@ export class PoppyAgent {
    */
   session(company: Company, userId: string): Promise<Session> {
     if (userId === "") return Promise.reject(new PoppyProtocolError("userId is required"));
-    const storeKey = `poppy:${this.clientId}:${company.issuer}:${userId}`;
+    const storeKey = this.#storeKey(company, userId);
     // One live Session per stored state, so two Sessions never overwrite each other's Account Token.
     let session = this.#sessions.get(storeKey);
     if (session === undefined) {
@@ -127,6 +129,38 @@ export class PoppyAgent {
       this.#sessions.set(storeKey, session);
     }
     return session;
+  }
+
+  /**
+   * Forgets `userId` at `company`: signs the Session out when it is signed in, then deletes its stored state.
+   * Sessions opened before stop working; the next {@link session} call starts a new, signed-out one.
+   * A failed revocation does not stop the state from being deleted.
+   */
+  async forget(company: Company, userId: string): Promise<void> {
+    const storeKey = this.#storeKey(company, userId);
+    const open = this.#sessions.get(storeKey);
+    let session: Session | undefined;
+    if (open !== undefined) {
+      session = await open.catch(() => undefined);
+    } else if (await this.#hasAccountToken(storeKey)) {
+      // Only then: opening a Session without an Account Token would start a new one at the Company.
+      session = await this.session(company, userId).catch(() => undefined);
+    }
+    await session?.signOut().catch(() => undefined);
+    if (session !== undefined) forgotten.add(session);
+    this.#sessions.delete(storeKey);
+    await this.#store.delete(storeKey);
+  }
+
+  #storeKey(company: Company, userId: string): string {
+    return `poppy:${this.clientId}:${company.issuer}:${userId}`;
+  }
+
+  async #hasAccountToken(storeKey: string): Promise<boolean> {
+    const stored = await this.#store.get(storeKey);
+    return (
+      stored !== undefined && (JSON.parse(stored) as PersistedState).accountToken !== undefined
+    );
   }
 
   async #openSession(company: Company, userId: string, storeKey: string): Promise<Session> {
@@ -346,7 +380,12 @@ export class Session {
     return next.scope ?? "";
   }
 
+  #ensureNotForgotten(): void {
+    if (forgotten.has(this)) throw new PoppyProtocolError("this Session was forgotten");
+  }
+
   async #persist(state: PersistedState): Promise<void> {
+    this.#ensureNotForgotten();
     await this.#init.persist(state);
     this.#state = state;
   }
@@ -360,6 +399,7 @@ export class Session {
   }
 
   async #currentToken(): Promise<string> {
+    this.#ensureNotForgotten();
     if (this.#accessToken === undefined || Date.now() >= this.#expiresAt - EXPIRY_MARGIN * 1000)
       await this.renew();
     if (this.#accessToken === undefined) throw new PoppyProtocolError("no Session Token");

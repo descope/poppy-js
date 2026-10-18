@@ -6,7 +6,7 @@
 export interface Store {
   get(key: string): Promise<string | undefined>;
   set(key: string, value: string): Promise<void>;
-  /** Not called by the SDK. Callers use it to forget a User; see the README for the key format. */
+  /** Called by {@link PoppyAgent.forget}. */
   delete(key: string): Promise<void>;
 }
 

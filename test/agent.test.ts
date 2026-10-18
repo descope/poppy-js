@@ -339,10 +339,13 @@ describe("Device Sign-In", () => {
     expect((await (await session.fetch(`${API}/a`)).json()).signedIn).toBe(true);
   });
 
-  it("revokes an approval that lands after sign-out", async () => {
+  it.each([
+    ["signed in", true],
+    ["signed out", false],
+  ])("revokes an approval that lands after sign-out (%s)", async (_, signedIn) => {
     const { mock, agent, company, store } = await setup();
     const session = await agent.session(company, USER_ID);
-    await signIn(mock, session);
+    if (signedIn) await signIn(mock, session);
     vi.useFakeTimers({ toFake: ["setTimeout"] });
     const done = (await session.startDeviceSignIn("poppy:read")).wait();
     const assertion = expect(done).rejects.toThrow(/signed out during Device Sign-In/);

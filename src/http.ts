@@ -4,7 +4,6 @@ export type Fetch = typeof fetch;
 
 const MAX_REDIRECTS = 5;
 
-/** Parses `value` and requires an `https:` URL. */
 export function httpsUrl(value: unknown, what: string): URL {
   if (typeof value !== "string") throw new PoppyProtocolError(`${what} is missing`);
   let url: URL;

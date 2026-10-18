@@ -74,7 +74,6 @@ function stringField(body: unknown, key: string): string | undefined {
   return typeof value === "string" ? value.slice(0, MAX_DESCRIPTION) : undefined;
 }
 
-/** Builds a PoppyError from an OAuth JSON error response, keeping only safe fields. */
 export async function errorFromResponse(response: Response): Promise<PoppyError> {
   let body: unknown;
   try {

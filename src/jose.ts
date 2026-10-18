@@ -38,7 +38,6 @@ export function nowSeconds(): number {
   return Math.floor(Date.now() / 1000);
 }
 
-/** Exports the public half of a P-256 key as a JWK with only public members. */
 export async function publicJwk(key: CryptoKey): Promise<JsonWebKey> {
   const { kty, crv, x, y } = await crypto.subtle.exportKey("jwk", key);
   return { kty, crv, x, y } as JsonWebKey;

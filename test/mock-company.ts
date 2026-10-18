@@ -128,7 +128,6 @@ export class MockCompany {
   grantedScope: string | undefined;
   /** Issue a new refresh token on every refresh and retire the old one. */
   rotateRefresh = false;
-  /** Session IDs the Company considers ended. */
   readonly endedSessions = new Set<string>();
   /** Refresh tokens that answer `invalid_grant`. */
   readonly revokedRefresh = new Set<string>();

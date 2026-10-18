@@ -11,7 +11,6 @@ const CLIENT_ASSERTION_TYPE = "urn:ietf:params:oauth:client-assertion-type:jwt-b
 const ASSERTION_LIFETIME = 60;
 /** Renew this many seconds before a Session Token expires, so a request never races the expiry. */
 const EXPIRY_MARGIN = 30;
-/** Errors meaning the Session is over and a new one must be started (spec 4.2, 4.4). */
 const SESSION_ENDED = new Set(["invalid_session", "account_mismatch"]);
 
 /** The key the agent signs its client and Session assertions with. Its public half is in the agent's `jwks_uri`. */
@@ -227,7 +226,6 @@ export class Session {
     await this.#renewWith(() => this.#assertionParams());
   }
 
-  /** Runs one token request, starting a new Session once if the Company says this one ended. */
   async #renewWith(params: () => Promise<Record<string, string>>): Promise<void> {
     try {
       await this.#applyToken(await this.#tokenRequest(params));
@@ -296,7 +294,6 @@ export class Session {
     if (nonce !== null) this.#nonces.set(new URL(url).origin, nonce);
   }
 
-  /** POSTs to the token endpoint with a DPoP Proof, retrying once with a new nonce if asked (spec 4.3). */
   async #tokenRequest(params: () => Promise<Record<string, string>>): Promise<TokenResponse> {
     const url = this.company.tokenEndpoint;
     for (let attempt = 0; ; attempt++) {

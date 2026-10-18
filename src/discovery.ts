@@ -160,7 +160,6 @@ export async function discover(website: string, options: { fetch?: Fetch } = {})
   };
 }
 
-/** Whether an authenticated request to `host` may carry this Company's Session Token. */
 export function isAllowedHost(company: Company, host: string): boolean {
   const lower = host.toLowerCase();
   return lower.endsWith(`.${company.domain}`) || company.allowedHosts.includes(lower);

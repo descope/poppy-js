@@ -13,6 +13,8 @@ const EXPIRY_MARGIN = 30;
 const SESSION_ENDED = new Set(["invalid_session", "account_mismatch"]);
 /** Sessions erased by {@link PoppyAgent.forget} must not write state back or use a token. */
 const forgotten = new WeakSet<Session>();
+// Signs out and marks the Session forgotten in one queued step, so nothing queued after it can write.
+let closeSession: (session: Session) => Promise<void>;
 
 /** Signs the agent's client and Session assertions. Publish the public half at `jwks_uri`. */
 export interface SigningKey {
@@ -133,7 +135,9 @@ export class PoppyAgent {
         forgetting === undefined
           ? this.#openSession(company, userId, storeKey)
           : forgetting.then(() => this.#openSession(company, userId, storeKey));
-      session.catch(() => this.#sessions.delete(storeKey));
+      session.catch(() => {
+        if (this.#sessions.get(storeKey) === session) this.#sessions.delete(storeKey);
+      });
       this.#sessions.set(storeKey, session);
     }
     return session;
@@ -170,8 +174,7 @@ export class PoppyAgent {
       // Without an Account Token there is nothing to revoke; opening a Session would create one.
       session = await this.#openSession(company, userId, storeKey).catch(() => undefined);
     }
-    await session?.signOut().catch(() => undefined);
-    if (session !== undefined) forgotten.add(session);
+    if (session !== undefined) await closeSession(session).catch(() => undefined);
     await this.#store.delete(storeKey);
   }
 
@@ -404,8 +407,9 @@ export class Session {
 
   async #persist(state: PersistedState): Promise<void> {
     this.#ensureNotForgotten();
-    await this.#init.persist(state);
+    // A rotated Account Token is already the only valid one, even if the write fails.
     this.#state = state;
+    await this.#init.persist(state);
   }
 
   async #forgetAccount(): Promise<void> {
@@ -567,7 +571,19 @@ export class Session {
     });
     const response = await postForm(this.#init.fetch, this.company.revocationEndpoint, body);
     if (!response.ok) throw await errorFromResponse(response);
+    await response.body?.cancel();
     await this.#forgetAccount();
+  }
+
+  static {
+    closeSession = (session) =>
+      session.#serial(async () => {
+        try {
+          await session.#signOut();
+        } finally {
+          forgotten.add(session);
+        }
+      });
   }
 }
 

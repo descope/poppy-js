@@ -33,6 +33,7 @@ type DevicePoll =
   | "authorization_pending"
   | "slow_down"
   | "access_denied"
+  | "expired_token"
   | "account_mismatch"
   | "approve";
 

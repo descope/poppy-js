@@ -119,6 +119,36 @@ describe("PoppyAgent", () => {
     expect(b).toBe(a);
     expect(store.state()["accountToken"]).toBe(mock.issuedSecrets[0]);
   });
+
+  it("keeps the Session requested during forget cached when an older open fails", async () => {
+    const { mock, company, store } = await setup();
+    let release = () => {};
+    const held = new Promise<void>((resolve) => (release = resolve));
+    let opening = () => {};
+    const openHeld = new Promise<void>((resolve) => (opening = resolve));
+    const { fetch } = mock;
+    let first = true;
+    mock.fetch = async (input, init) => {
+      if (first && String(input) === TOKEN_ENDPOINT) {
+        first = false;
+        opening();
+        await held;
+        return new Response(null, { status: 503 });
+      }
+      return fetch(input, init);
+    };
+    const agent = mock.agent({ store });
+    const older = agent.session(company, USER_ID);
+    const olderOutcome = older.catch((error: unknown) => error);
+    await openHeld;
+    const forgetting = agent.forget(company, USER_ID);
+    const next = agent.session(company, USER_ID);
+    release();
+    expect(await olderOutcome).toBeInstanceOf(Error);
+    await forgetting;
+    await next;
+    expect(agent.session(company, USER_ID)).toBe(next);
+  });
 });
 
 describe("Session renew", () => {
@@ -361,6 +391,18 @@ describe("Device Sign-In", () => {
     expect(session.signedIn).toBe(false);
   });
 
+  it("rejects with expired_token when the Company says the code expired", async () => {
+    const { mock, agent, company } = await setup();
+    mock.devicePolls = ["expired_token"];
+    const session = await agent.session(company, USER_ID);
+    vi.useFakeTimers({ toFake: ["setTimeout"] });
+    const done = (await session.startDeviceSignIn("poppy:read")).wait();
+    const assertion = expect(done).rejects.toMatchObject({ error: "expired_token" });
+    await vi.advanceTimersByTimeAsync(5_000);
+    await assertion;
+    expect(session.signedIn).toBe(false);
+  });
+
   it("stops when the signal aborts", async () => {
     const { mock, agent, company } = await setup();
     mock.devicePolls = ["authorization_pending"];
@@ -492,6 +534,27 @@ describe("signed-in renew and sign-out", () => {
     await session.renew();
     expect(mock.callsTo(TOKEN_ENDPOINT).at(-1)?.form?.get("refresh_token")).toBe(rotated);
     expect(session.signedIn).toBe(true);
+  });
+
+  it("sends the rotated Account Token after the store failed to save it", async () => {
+    const { mock, agent, company, store } = await setup();
+    const session = await agent.session(company, USER_ID);
+    await signIn(mock, session);
+    mock.rotateRefresh = true;
+    const { set } = store;
+    let failed = false;
+    store.set = async (key, value) => {
+      if (!failed) {
+        failed = true;
+        throw new Error("disk full");
+      }
+      return set.call(store, key, value);
+    };
+    await expect(session.renew()).rejects.toThrow("disk full");
+    await session.renew();
+    expect(mock.callsTo(TOKEN_ENDPOINT).at(-1)?.form?.get("refresh_token")).toBe(
+      mock.issuedSecrets[1],
+    );
   });
 
   it("keeps the Account Token when revocation fails", async () => {
@@ -677,6 +740,44 @@ describe("forget", () => {
     expect(store.values.size).toBe(0);
   });
 
+  it("rejects a device sign-in that completes while forget is signing out", async () => {
+    const { mock, company, store } = await setup();
+    let release = () => {};
+    const held = new Promise<void>((resolve) => (release = resolve));
+    let revoking = () => {};
+    const revokeHeld = new Promise<void>((resolve) => (revoking = resolve));
+    let polled = () => {};
+    const approved = new Promise<void>((resolve) => (polled = resolve));
+    const { fetch } = mock;
+    mock.fetch = async (input, init) => {
+      if (String(input) === REVOCATION_ENDPOINT) {
+        revoking();
+        await held;
+      }
+      const response = await fetch(input, init);
+      const grantType = init?.body instanceof URLSearchParams && init.body.get("grant_type");
+      if (grantType === "urn:ietf:params:oauth:grant-type:device_code") polled();
+      return response;
+    };
+    const agent = mock.agent({ store });
+    const session = await agent.session(company, USER_ID);
+    await signIn(mock, session);
+    vi.useFakeTimers({ toFake: ["setTimeout"] });
+    const outcome = (await session.startDeviceSignIn("poppy:read")).wait().catch((e: unknown) => e);
+    const forgetting = agent.forget(company, USER_ID);
+    await revokeHeld;
+    await vi.advanceTimersByTimeAsync(5_000);
+    vi.useRealTimers();
+    await approved;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    release();
+    await forgetting;
+    const error = await outcome;
+    expect(error).toBeInstanceOf(PoppyProtocolError);
+    expect(error).toMatchObject({ errorDescription: "this Session was forgotten" });
+    expect(store.values.size).toBe(0);
+  });
+
   it("starts a new signed-out Session afterwards", async () => {
     const { mock, agent, company, store } = await setup();
     const session = await agent.session(company, USER_ID);
@@ -703,6 +804,30 @@ describe("forget", () => {
     await mock.agent({ store }).forget(company, USER_ID);
     expect(mock.callsTo(TOKEN_ENDPOINT)).toHaveLength(tokenCalls);
     expect(store.values.size).toBe(0);
+  });
+
+  it("does not follow a redirect from the token endpoint", async () => {
+    const { mock, agent, company } = await setup();
+    const session = await agent.session(company, USER_ID);
+    mock.routes.set(
+      TOKEN_ENDPOINT,
+      () => new Response(null, { status: 302, headers: { location: "https://example.org/x" } }),
+    );
+    await expect(session.renew()).rejects.toBeInstanceOf(Error);
+    expect(mock.callsTo("https://example.org/x")).toHaveLength(0);
+  });
+
+  it("does not follow a redirect from the revocation endpoint", async () => {
+    const { mock, agent, company } = await setup();
+    const session = await agent.session(company, USER_ID);
+    await signIn(mock, session);
+    mock.routes.set(
+      REVOCATION_ENDPOINT,
+      () => new Response(null, { status: 302, headers: { location: "https://example.org/x" } }),
+    );
+    await expect(session.signOut()).rejects.toBeInstanceOf(Error);
+    expect(mock.callsTo("https://example.org/x")).toHaveLength(0);
+    expect(session.signedIn).toBe(true);
   });
 });
 

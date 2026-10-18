@@ -30,11 +30,15 @@ export async function getJson(
     });
     if (response.status >= 300 && response.status < 400) {
       const location = response.headers.get("location");
+      await response.body?.cancel();
       if (location === null) throw new PoppyProtocolError(`${what} redirect has no Location`);
       current = httpsUrl(new URL(location, current).href, `${what} redirect`);
       continue;
     }
-    if (!response.ok) throw new PoppyProtocolError(`${what} returned HTTP ${response.status}`);
+    if (!response.ok) {
+      await response.body?.cancel();
+      throw new PoppyProtocolError(`${what} returned HTTP ${response.status}`);
+    }
     try {
       return { body: await response.json(), url: current };
     } catch {

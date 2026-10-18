@@ -311,20 +311,7 @@ export class Session {
   }
 
   async #assertionParams(): Promise<Record<string, string>> {
-    const { clientId, userId, company, signingKey } = this.#init;
-    const iat = nowSeconds();
-    const assertion = await signJwt(
-      { typ: "JWT", kid: signingKey.kid },
-      {
-        iss: clientId,
-        sub: userId,
-        aud: company.issuer,
-        iat,
-        exp: iat + ASSERTION_LIFETIME,
-        jti: randomId(),
-      },
-      signingKey.privateKey,
-    );
+    const assertion = await this.#signAssertion(this.#init.userId);
     return { grant_type: JWT_BEARER, assertion, ...this.#sessionParam() };
   }
 
@@ -341,13 +328,22 @@ export class Session {
   }
 
   async #clientAuth(): Promise<Record<string, string>> {
+    const { clientId } = this.#init;
+    return {
+      client_id: clientId,
+      client_assertion_type: CLIENT_ASSERTION_TYPE,
+      client_assertion: await this.#signAssertion(clientId),
+    };
+  }
+
+  async #signAssertion(sub: string): Promise<string> {
     const { clientId, company, signingKey } = this.#init;
     const iat = nowSeconds();
-    const assertion = await signJwt(
+    return signJwt(
       { typ: "JWT", kid: signingKey.kid },
       {
         iss: clientId,
-        sub: clientId,
+        sub,
         aud: company.issuer,
         iat,
         exp: iat + ASSERTION_LIFETIME,
@@ -355,11 +351,6 @@ export class Session {
       },
       signingKey.privateKey,
     );
-    return {
-      client_id: clientId,
-      client_assertion_type: CLIENT_ASSERTION_TYPE,
-      client_assertion: assertion,
-    };
   }
 
   #rememberNonce(url: string, response: Response): void {

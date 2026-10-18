@@ -92,6 +92,7 @@ export class PoppyAgent {
   readonly #signingKey: SigningKey;
   readonly #store: Store;
   readonly #fetch: Fetch;
+  readonly #sessions = new Map<string, Promise<Session>>();
 
   constructor(options: PoppyAgentOptions) {
     if (httpsUrl(options.clientId, "clientId").href !== options.clientId) {
@@ -114,9 +115,20 @@ export class PoppyAgent {
    * `userId` is the opaque ID this agent gives the User for this Company (spec 4.2). It must be stable, differ per
    * Company, and must not contain or be derived from personal data such as an email, even with a keyed hash.
    */
-  async session(company: Company, userId: string): Promise<Session> {
-    if (userId === "") throw new PoppyProtocolError("userId is required");
+  session(company: Company, userId: string): Promise<Session> {
+    if (userId === "") return Promise.reject(new PoppyProtocolError("userId is required"));
     const storeKey = `poppy:${this.clientId}:${company.issuer}:${userId}`;
+    // One live Session per stored state, so two Sessions never overwrite each other's Account Token.
+    let session = this.#sessions.get(storeKey);
+    if (session === undefined) {
+      session = this.#openSession(company, userId, storeKey);
+      session.catch(() => this.#sessions.delete(storeKey));
+      this.#sessions.set(storeKey, session);
+    }
+    return session;
+  }
+
+  async #openSession(company: Company, userId: string, storeKey: string): Promise<Session> {
     const stored = await this.#store.get(storeKey);
     let state: PersistedState;
     let dpopKey: DpopKey;

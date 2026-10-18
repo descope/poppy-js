@@ -339,6 +339,21 @@ describe("Device Sign-In", () => {
     expect((await (await session.fetch(`${API}/a`)).json()).signedIn).toBe(true);
   });
 
+  it("revokes an approval that lands after sign-out", async () => {
+    const { mock, agent, company, store } = await setup();
+    const session = await agent.session(company, USER_ID);
+    await signIn(mock, session);
+    vi.useFakeTimers({ toFake: ["setTimeout"] });
+    const done = (await session.startDeviceSignIn("poppy:read")).wait();
+    const assertion = expect(done).rejects.toThrow(/signed out during Device Sign-In/);
+    await session.signOut();
+    await vi.advanceTimersByTimeAsync(5_000);
+    await assertion;
+    expect(session.signedIn).toBe(false);
+    expect(store.state()["accountToken"]).toBeUndefined();
+    expect([...mock.revokedRefresh]).toEqual(mock.issuedSecrets);
+  });
+
   it("returns a partial grant instead of failing", async () => {
     const { mock, agent, company } = await setup();
     mock.grantedScope = "poppy:read";
@@ -823,8 +838,11 @@ describe("forget", () => {
     await forgetting;
     const error = await outcome;
     expect(error).toBeInstanceOf(PoppyProtocolError);
-    expect(error).toMatchObject({ errorDescription: "this Session was forgotten" });
+    expect(error).toMatchObject({
+      errorDescription: "the Session signed out during Device Sign-In",
+    });
     expect(store.values.size).toBe(0);
+    expect([...mock.revokedRefresh]).toEqual(mock.issuedSecrets);
   });
 
   it("starts a new signed-out Session afterwards", async () => {

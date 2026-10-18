@@ -247,6 +247,7 @@ export class Session {
   #expiresAt = 0;
   #signedIn = false;
   #renewing: Promise<void> | undefined;
+  #signOuts = 0;
   #queue: Promise<unknown> = Promise.resolve();
   readonly #nonces = new Map<string, string>();
 
@@ -496,6 +497,7 @@ export class Session {
    * @param scope Space-separated, each from `company.deviceScopes`.
    */
   async startDeviceSignIn(scope: string): Promise<DeviceSignIn> {
+    const signOuts = this.#signOuts;
     const { deviceAuthorizationEndpoint, deviceScopes } = this.company;
     if (deviceAuthorizationEndpoint === undefined || deviceScopes === undefined) {
       throw new PoppyProtocolError(`${this.company.domain} does not offer Device Sign-In`);
@@ -555,20 +557,32 @@ export class Session {
           throw error;
         }
       },
-      (token) => this.#serial(() => this.#applyToken(token, requested.join(" "))),
+      (token) =>
+        this.#serial(async () => {
+          if (this.#signOuts === signOuts) return this.#applyToken(token, requested.join(" "));
+          if (token.refreshToken !== undefined) await this.#revoke(token.refreshToken);
+          throw new PoppyProtocolError("the Session signed out during Device Sign-In");
+        }),
     );
   }
 
   /**
-   * Revokes the Account Token (spec 4.9); the Session continues signed out. No-op when signed out.
+   * Revokes the Account Token (spec 4.9); the Session continues signed out. A pending Device Sign-In
+   * that completes later is revoked and rejects.
    */
   signOut(): Promise<void> {
     return this.#serial(() => this.#signOut());
   }
 
   async #signOut(): Promise<void> {
+    this.#signOuts += 1;
     const token = this.#state.accountToken;
     if (token === undefined) return;
+    await this.#revoke(token);
+    await this.#forgetAccount();
+  }
+
+  async #revoke(token: string): Promise<void> {
     const body = new URLSearchParams({
       token,
       token_type_hint: "refresh_token",
@@ -577,7 +591,6 @@ export class Session {
     const response = await postForm(this.#init.fetch, this.company.revocationEndpoint, body);
     if (!response.ok) throw await errorFromResponse(response);
     await response.body?.cancel();
-    await this.#forgetAccount();
   }
 
   static {

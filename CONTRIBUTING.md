@@ -26,7 +26,7 @@ CI runs the same checks on Node.js 22, 24 and 26.
 
 - **Follow the spec.** Behavior comes from the [Personal Agent Protocol specification](https://personalagentprotocol.org/docs/spec.md), not from any one Company's server. Cite the section in code comments where a rule is not obvious.
 - **No runtime dependencies.** The SDK uses `fetch` and WebCrypto only. Dev dependencies are pinned to exact versions.
-- **Test against the mock Company.** `test/mock-company.ts` verifies signatures, DPoP proofs and assertions the way a Company must. New behavior gets a test there, including the error paths.
+- **Test against the mock Company.** `test/mock-company.ts` verifies signatures, DPoP proofs and assertions the way a Company must. New behavior gets a test there, including the error paths. [docs/interop.md](docs/interop.md) covers what can also run against a real OAuth server.
 - **Keep secrets out of errors and logs.** Tokens, device codes and assertions live in private fields and never appear in error messages.
 - **One change per pull request**, with a commit message in the imperative mood.
 

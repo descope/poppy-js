@@ -32,12 +32,12 @@ CI runs the same checks on Node.js 22, 24 and 26.
 
 ## Releases
 
-[release-please](https://github.com/googleapis/release-please) reads the Conventional Commit messages on `main` (`feat:`, `fix:`, `feat!:`) and keeps a release pull request open with the next version and changelog. Merging that pull request tags the release, and `.github/workflows/release.yml` then publishes to npm with provenance. Nothing is published on other pushes.
+[release-please](https://github.com/googleapis/release-please) reads the Conventional Commit messages on `main` (`feat:`, `fix:`, `feat!:`) and keeps a release pull request open with the next version and changelog. Merging that pull request tags the release, and `.github/workflows/release.yml` then publishes to npm through [trusted publishing](https://docs.npmjs.com/trusted-publishers) (GitHub OIDC, no npm token). npm adds a provenance attestation once the repository is public. Nothing is published on other pushes.
 
-The workflow needs these repository secrets:
+The workflow needs:
 
-- `RELEASE_APP_ID` and `RELEASE_APP_PEM`: the GitHub App that opens the release pull request.
-- `NPM_TOKEN`: an npm granular access token with publish rights on `@descope/poppy`. Not needed if npm trusted publishing (OIDC) is set up for this repository instead.
+- Repository secrets `RELEASE_APP_ID` and `RELEASE_APP_PEM`: the GitHub App that opens the release pull request.
+- A trusted publisher on npmjs.com for `@descope/poppy` (package Settings, Trusted publishing, GitHub Actions): organization `descope`, repository `poppy-js`, workflow `release.yml`, no environment, `npm publish` allowed.
 
 ## Reporting security issues
 

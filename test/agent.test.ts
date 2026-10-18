@@ -740,6 +740,38 @@ describe("forget", () => {
     expect(store.values.size).toBe(0);
   });
 
+  it("revokes the Account Token rotated by a renew that was pending when forget started", async () => {
+    const { mock, company, store } = await setup();
+    mock.rotateRefresh = true;
+    let release = () => {};
+    const held = new Promise<void>((resolve) => (release = resolve));
+    let requested = () => {};
+    const renewHeld = new Promise<void>((resolve) => (requested = resolve));
+    const { fetch } = mock;
+    mock.fetch = async (input, init) => {
+      const response = await fetch(input, init);
+      const grantType = init?.body instanceof URLSearchParams && init.body.get("grant_type");
+      if (grantType === "refresh_token") {
+        requested();
+        await held;
+      }
+      return response;
+    };
+    const agent = mock.agent({ store });
+    const session = await agent.session(company, USER_ID);
+    await signIn(mock, session);
+    const renewing = session.renew();
+    await renewHeld;
+    const forgetting = agent.forget(company, USER_ID);
+    release();
+    await Promise.all([renewing, forgetting]);
+    const rotated = mock.issuedSecrets.at(-1);
+    expect(rotated).not.toBe(mock.issuedSecrets[0]);
+    expect(mock.callsTo(REVOCATION_ENDPOINT).at(-1)?.form?.get("token")).toBe(rotated);
+    expect(store.values.size).toBe(0);
+    await expect(session.renew()).rejects.toBeInstanceOf(PoppyProtocolError);
+  });
+
   it("rejects a device sign-in that completes while forget is signing out", async () => {
     const { mock, company, store } = await setup();
     let release = () => {};

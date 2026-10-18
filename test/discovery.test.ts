@@ -70,6 +70,16 @@ describe("discover", () => {
     await rejects(company, /must use https/);
   });
 
+  it("refuses an http website", async () => {
+    await rejects(await MockCompany.create(), /must use https/, "http://example.com");
+  });
+
+  it("refuses poppy.json without organization.domain", async () => {
+    const company = await MockCompany.create();
+    company.poppy = { ...company.poppy, organization: { name: "Example" } };
+    await rejects(company, /organization.domain is missing/);
+  });
+
   it("refuses an unsupported major version", async () => {
     const company = await MockCompany.create();
     company.poppy = { ...company.poppy, protocol_version: "1.0" };
@@ -100,10 +110,19 @@ describe("discover", () => {
     await rejects(company, /poppy_domains/);
   });
 
-  it("refuses an issuer without ES256 DPoP", async () => {
+  it.each([
+    [["RS256"], /ES256/],
+    [undefined, /dpop_signing_alg_values_supported must be a list/],
+  ])("refuses an issuer without ES256 DPoP (%j)", async (algs, message) => {
     const company = await MockCompany.create();
-    company.metadata = { ...company.metadata, dpop_signing_alg_values_supported: ["RS256"] };
-    await rejects(company, /ES256/);
+    company.metadata = { ...company.metadata, dpop_signing_alg_values_supported: algs };
+    await rejects(company, message);
+  });
+
+  it("refuses an http token_endpoint", async () => {
+    const company = await MockCompany.create();
+    company.metadata = { ...company.metadata, token_endpoint: "http://auth.example.com/token" };
+    await rejects(company, /token_endpoint must use https/);
   });
 
   it.each(["token_endpoint", "revocation_endpoint", "device_authorization_endpoint"])(

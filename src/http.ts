@@ -21,6 +21,7 @@ function isPrivateIpv4([a = 0, b = 0]: number[]): boolean {
     a === 0 ||
     a === 10 ||
     a === 127 ||
+    (a === 100 && b >= 64 && b <= 127) ||
     (a === 169 && b === 254) ||
     (a === 172 && b >= 16 && b <= 31) ||
     (a === 192 && b === 168)
@@ -28,8 +29,9 @@ function isPrivateIpv4([a = 0, b = 0]: number[]): boolean {
 }
 
 /**
- * Loopback, private and link-local addresses and `localhost` (spec 3). Takes a WHATWG URL hostname, which is
- * already normalized (`0x7f.1` becomes `127.0.0.1`, `::ffff:127.0.0.1` becomes `[::ffff:7f00:1]`).
+ * Loopback, private, shared (100.64/10), link-local and site-local addresses and `localhost` (spec 3).
+ * Takes a WHATWG URL hostname, which is already normalized (`0x7f.1` becomes `127.0.0.1`,
+ * `::ffff:127.0.0.1` becomes `[::ffff:7f00:1]`).
  * ponytail: checks the name only; a DNS name that resolves to a private address is not caught.
  */
 export function isPrivateHost(hostname: string): boolean {
@@ -39,16 +41,19 @@ export function isPrivateHost(hostname: string): boolean {
     .replace(/\.$/, "");
   if (host === "localhost" || host.endsWith(".localhost")) return true;
   if (/^[\d.]+$/.test(host)) return isPrivateIpv4(host.split(".").map(Number));
-  const mapped = /^::ffff:([\da-f]{1,4}):[\da-f]{1,4}$/.exec(host);
-  if (mapped !== null) {
-    const high = Number.parseInt(mapped[1] ?? "", 16);
+  // An IPv4 address inside IPv6: mapped, translated, compatible, NAT64 (64:ff9b::/96) and 6to4 (2002::/16).
+  const embedded =
+    /^(?:::(?:ffff:(?:0:)?)?|64:ff9b::)([\da-f]{1,4}):[\da-f]{1,4}$/.exec(host) ??
+    /^2002:([\da-f]{1,4})(?::|$)/.exec(host);
+  if (embedded !== null) {
+    const high = Number.parseInt(embedded[1] ?? "", 16);
     return isPrivateIpv4([high >> 8, high & 0xff]);
   }
   return (
     host === "::" ||
     host === "::1" ||
     /^f[cd][\da-f]{2}:/.test(host) ||
-    /^fe[89ab][\da-f]:/.test(host)
+    /^fe[89a-f][\da-f]:/.test(host)
   );
 }
 

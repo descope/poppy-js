@@ -253,7 +253,6 @@ export class PoppyAgent {
     try {
       return (JSON.parse(stored) as PersistedState).accountToken;
     } catch {
-      // Unreadable state holds no token we can revoke.
       return undefined;
     }
   }
@@ -613,6 +612,9 @@ export class Session {
   /** The User's sign-in link must be on the issuer host or a `poppy_domains` entry, or a subdomain. */
   #signInUrl(value: unknown, what: string): string {
     const url = httpsUrl(value, what);
+    if (url.username !== "" || url.password !== "") {
+      throw new PoppyProtocolError(`${what} must not contain credentials`);
+    }
     const host = url.hostname;
     const allowed = [new URL(this.company.issuer).hostname, ...this.company.poppyDomains];
     if (!allowed.some((domain) => host === domain || host.endsWith(`.${domain}`))) {

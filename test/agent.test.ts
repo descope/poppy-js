@@ -458,10 +458,15 @@ describe("Device Sign-In", () => {
   });
 
   it.each([
-    ["verification_uri", "https://evil.example.net/device"],
-    ["verification_uri", "https://notexample.com/device"],
-    ["verification_uri_complete", "https://evil.example.net/device?user_code=WDJB-MJHT"],
-  ])("refuses a %s off the issuer and poppy_domains (%s)", async (field, url) => {
+    ["verification_uri", "https://evil.example.net/device", /poppy_domains/],
+    ["verification_uri", "https://notexample.com/device", /poppy_domains/],
+    ["verification_uri", "https://user:pw@example.com/device", /credentials/],
+    [
+      "verification_uri_complete",
+      "https://evil.example.net/device?user_code=WDJB-MJHT",
+      /poppy_domains/,
+    ],
+  ])("refuses a %s off the issuer and poppy_domains (%s)", async (field, url, error) => {
     const { mock, agent, company } = await setup();
     const session = await agent.session(company, USER_ID);
     mock.routes.set(DEVICE_ENDPOINT, () =>
@@ -473,7 +478,7 @@ describe("Device Sign-In", () => {
         [field]: url,
       }),
     );
-    await expect(session.startDeviceSignIn("poppy:read")).rejects.toThrow(/poppy_domains/);
+    await expect(session.startDeviceSignIn("poppy:read")).rejects.toThrow(error);
   });
 
   it.each(["https://auth.example.com/device", "https://login.example.com/device"])(

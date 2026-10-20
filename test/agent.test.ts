@@ -457,6 +457,42 @@ describe("Device Sign-In", () => {
     await expect(session.startDeviceSignIn("poppy:read")).rejects.toThrow(/https/);
   });
 
+  it.each([
+    ["verification_uri", "https://evil.example.net/device"],
+    ["verification_uri", "https://notexample.com/device"],
+    ["verification_uri_complete", "https://evil.example.net/device?user_code=WDJB-MJHT"],
+  ])("refuses a %s off the issuer and poppy_domains (%s)", async (field, url) => {
+    const { mock, agent, company } = await setup();
+    const session = await agent.session(company, USER_ID);
+    mock.routes.set(DEVICE_ENDPOINT, () =>
+      Response.json({
+        device_code: "dc-secret-1",
+        user_code: "WDJB-MJHT",
+        verification_uri: "https://example.com/device",
+        expires_in: 600,
+        [field]: url,
+      }),
+    );
+    await expect(session.startDeviceSignIn("poppy:read")).rejects.toThrow(/poppy_domains/);
+  });
+
+  it.each(["https://auth.example.com/device", "https://login.example.com/device"])(
+    "accepts a verification_uri on the issuer host or a poppy_domains subdomain (%s)",
+    async (url) => {
+      const { mock, agent, company } = await setup();
+      const session = await agent.session(company, USER_ID);
+      mock.routes.set(DEVICE_ENDPOINT, () =>
+        Response.json({
+          device_code: "dc-secret-1",
+          user_code: "WDJB-MJHT",
+          verification_uri: url,
+          expires_in: 600,
+        }),
+      );
+      expect((await session.startDeviceSignIn("poppy:read")).verificationUri).toBe(url);
+    },
+  );
+
   it("forgets the Session when the User signed in to a different account", async () => {
     const { mock, agent, company, store } = await setup();
     mock.devicePolls = ["account_mismatch"];
@@ -667,17 +703,40 @@ describe("forget", () => {
     expect(store.values.size).toBe(0);
   });
 
-  it("deletes the state and stops old handles when revocation fails", async () => {
+  it("keeps the state but stops old handles when revocation fails, and can retry", async () => {
     const { mock, agent, company, store } = await setup();
     const session = await agent.session(company, USER_ID);
     await signIn(mock, session);
     mock.routes.set(REVOCATION_ENDPOINT, () => new Response(null, { status: 503 }));
-    await agent.forget(company, USER_ID);
-    expect(store.values.size).toBe(0);
+    await expect(agent.forget(company, USER_ID)).rejects.toBeInstanceOf(PoppyError);
+    expect(store.state()["accountToken"]).toBe(mock.issuedSecrets[0]);
     const tokenCalls = mock.callsTo(TOKEN_ENDPOINT).length;
     await expect(session.fetch(`${API}/a`)).rejects.toBeInstanceOf(PoppyProtocolError);
     await expect(session.renew()).rejects.toBeInstanceOf(PoppyProtocolError);
     expect(mock.callsTo(TOKEN_ENDPOINT)).toHaveLength(tokenCalls);
+    mock.routes.delete(REVOCATION_ENDPOINT);
+    await agent.forget(company, USER_ID);
+    expect(mock.revokedRefresh.has(mock.issuedSecrets[0] ?? "")).toBe(true);
+    expect(store.values.size).toBe(0);
+  });
+
+  it("revokes the stored Account Token without opening a Session", async () => {
+    const { mock, agent, company, store } = await setup();
+    await signIn(mock, await agent.session(company, USER_ID));
+    const fresh = mock.agent({ store });
+    const tokenCalls = mock.callsTo(TOKEN_ENDPOINT).length;
+    await fresh.forget(company, USER_ID);
+    expect(mock.callsTo(TOKEN_ENDPOINT)).toHaveLength(tokenCalls);
+    expect(mock.callsTo(REVOCATION_ENDPOINT)[0]?.form?.get("token")).toBe(mock.issuedSecrets[0]);
+    expect(store.values.size).toBe(0);
+  });
+
+  it("keeps the stored state when revoking it without a Session fails", async () => {
+    const { mock, agent, company, store } = await setup();
+    await signIn(mock, await agent.session(company, USER_ID));
+    mock.routes.set(REVOCATION_ENDPOINT, () => new Response(null, { status: 503 }));
+    await expect(mock.agent({ store }).forget(company, USER_ID)).rejects.toBeInstanceOf(PoppyError);
+    expect(store.state()["accountToken"]).toBe(mock.issuedSecrets[0]);
   });
 
   it("opens a Session requested during forget only after the state is deleted", async () => {
@@ -714,7 +773,6 @@ describe("forget", () => {
     const held = new Promise<void>((resolve) => (release = resolve));
     let revoking = () => {};
     const revokeHeld = new Promise<void>((resolve) => (revoking = resolve));
-    mock.routes.set(REVOCATION_ENDPOINT, () => new Response(null, { status: 503 }));
     const { fetch } = mock;
     mock.fetch = async (input, init) => {
       if (String(input) === REVOCATION_ENDPOINT) {

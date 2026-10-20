@@ -1,5 +1,5 @@
 import { PoppyProtocolError } from "./errors.ts";
-import { type Fetch, getJson, httpsUrl, isObject } from "./http.ts";
+import { checkPublicHost, type Fetch, getJson, httpsUrl, isObject } from "./http.ts";
 
 const SUPPORTED_MAJOR = "0";
 
@@ -17,6 +17,8 @@ export interface Company {
   domain: string;
   name: string;
   issuer: string;
+  /** `poppy_domains` from the issuer metadata, lowercased. */
+  poppyDomains: readonly string[];
   tokenEndpoint: string;
   revocationEndpoint: string;
   deviceAuthorizationEndpoint: string | undefined;
@@ -79,14 +81,27 @@ function agentHosts(agent: unknown): string[] {
   );
 }
 
+export interface DiscoverOptions {
+  /** Defaults to the global `fetch`. */
+  fetch?: Fetch;
+  /** Allow loopback, private and link-local hosts, such as `localhost` in tests. Off by default (spec 3). */
+  allowPrivateAddresses?: boolean;
+}
+
 /**
  * Fetches a Company's poppy.json and its issuer's OAuth metadata and checks both (spec 3, 3.2).
  * Throws {@link PoppyProtocolError} on any failed check, so no token goes to a Company that did not prove it
  * owns the issuer.
  */
-export async function discover(website: string, options: { fetch?: Fetch } = {}): Promise<Company> {
+export async function discover(website: string, options: DiscoverOptions = {}): Promise<Company> {
   const fetchFn = options.fetch ?? fetch;
-  const { body: doc, url: finalUrl } = await getJson(fetchFn, websiteUrl(website), "poppy.json");
+  const allowPrivate = options.allowPrivateAddresses ?? false;
+  const { body: doc, url: finalUrl } = await getJson(
+    fetchFn,
+    websiteUrl(website),
+    "poppy.json",
+    allowPrivate,
+  );
   if (!isObject(doc)) throw new PoppyProtocolError("poppy.json must be an object");
 
   const version = string(doc["protocol_version"], "protocol_version");
@@ -112,12 +127,19 @@ export async function discover(website: string, options: { fetch?: Fetch } = {})
     ? stringList(device["scopes"], "auth.device.scopes")
     : undefined;
 
-  const { body: metadata } = await getJson(fetchFn, metadataUrl(issuer), "OAuth metadata");
+  const { body: metadata } = await getJson(
+    fetchFn,
+    metadataUrl(issuer),
+    "OAuth metadata",
+    allowPrivate,
+  );
   if (!isObject(metadata)) throw new PoppyProtocolError("OAuth metadata must be an object");
   if (metadata["issuer"] !== issuer)
     throw new PoppyProtocolError("OAuth metadata issuer does not match auth.issuer");
-  const poppyDomains = stringList(metadata["poppy_domains"] ?? null, "poppy_domains");
-  if (!poppyDomains.some((entry) => entry.toLowerCase() === domain)) {
+  const poppyDomains = stringList(metadata["poppy_domains"] ?? null, "poppy_domains").map((entry) =>
+    entry.toLowerCase(),
+  );
+  if (!poppyDomains.includes(domain)) {
     throw new PoppyProtocolError(`poppy_domains does not list ${domain}`);
   }
   const algs = stringList(
@@ -128,10 +150,11 @@ export async function discover(website: string, options: { fetch?: Fetch } = {})
     throw new PoppyProtocolError("dpop_signing_alg_values_supported must include ES256");
 
   const apis = parseApis(doc["apis"]);
-  return {
+  const company: Company = {
     domain,
     name: typeof organization["name"] === "string" ? organization["name"] : domain,
     issuer,
+    poppyDomains,
     tokenEndpoint: httpsUrl(metadata["token_endpoint"], "token_endpoint").href,
     revocationEndpoint: httpsUrl(metadata["revocation_endpoint"], "revocation_endpoint").href,
     deviceAuthorizationEndpoint:
@@ -148,6 +171,15 @@ export async function discover(website: string, options: { fetch?: Fetch } = {})
       ]),
     ],
   };
+  for (const url of [
+    company.tokenEndpoint,
+    company.revocationEndpoint,
+    company.deviceAuthorizationEndpoint,
+    ...company.allowedHosts.map((host) => `https://${host}`),
+  ]) {
+    if (url !== undefined) checkPublicHost(new URL(url), "Company URL", allowPrivate);
+  }
+  return company;
 }
 
 export function isAllowedHost(company: Company, host: string): boolean {

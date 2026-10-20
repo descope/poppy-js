@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { isAllowedHost, metadataUrl } from "../src/discovery.ts";
+import { isPrivateHost } from "../src/http.ts";
 import { discover, PoppyProtocolError } from "../src/index.ts";
 import { ISSUER, METADATA_URL, MockCompany, TOKEN_ENDPOINT, WEBSITE } from "./mock-company.ts";
 
@@ -134,6 +135,41 @@ describe("discover", () => {
     },
   );
 
+  it("refuses a private website", async () => {
+    await rejects(await MockCompany.create(), /private address/, "localhost");
+  });
+
+  it("refuses a redirect to a private address", async () => {
+    const company = await MockCompany.create();
+    company.routes.set(POPPY_URL, redirect("https://10.0.0.5/.well-known/poppy.json"));
+    await rejects(company, /10\.0\.0\.5 is a private address/);
+  });
+
+  it.each(["token_endpoint", "revocation_endpoint", "device_authorization_endpoint"])(
+    "refuses a %s on a private address",
+    async (field) => {
+      const company = await MockCompany.create();
+      company.metadata = { ...company.metadata, [field]: "https://169.254.169.254/x" };
+      await rejects(company, /169\.254\.169\.254 is a private address/);
+    },
+  );
+
+  it("refuses an API on a private address", async () => {
+    const company = await MockCompany.create();
+    company.poppy = { ...company.poppy, apis: [{ type: "mcp", url: "https://[::1]/mcp" }] };
+    await rejects(company, /private address/);
+  });
+
+  it("allows private addresses when asked to", async () => {
+    const company = await MockCompany.create();
+    company.metadata = { ...company.metadata, token_endpoint: "https://127.0.0.1/token" };
+    const result = await discover("example.com", {
+      fetch: company.fetch,
+      allowPrivateAddresses: true,
+    });
+    expect(result.tokenEndpoint).toBe("https://127.0.0.1/token");
+  });
+
   it("gives up after five redirects", async () => {
     const company = await MockCompany.create();
     company.routes.set(POPPY_URL, redirect(POPPY_URL));
@@ -172,5 +208,37 @@ describe("isAllowedHost", () => {
     expect(isAllowedHost(company, "sub.api.example.net")).toBe(false);
     expect(isAllowedHost(company, "ignored.example.org")).toBe(false);
     expect(isAllowedHost(company, "other.example.org")).toBe(false);
+  });
+});
+
+describe("isPrivateHost", () => {
+  it.each([
+    ["https://localhost/", true],
+    ["https://localhost./", true],
+    ["https://app.localhost/", true],
+    ["https://127.0.0.1/", true],
+    ["https://0x7f.1/", true],
+    ["https://0.0.0.0/", true],
+    ["https://10.1.2.3/", true],
+    ["https://172.16.0.1/", true],
+    ["https://172.31.255.255/", true],
+    ["https://192.168.1.1/", true],
+    ["https://169.254.169.254/", true],
+    ["https://[::]/", true],
+    ["https://[::1]/", true],
+    ["https://[::ffff:127.0.0.1]/", true],
+    ["https://[::ffff:a00:1]/", true],
+    ["https://[fd12:3456::1]/", true],
+    ["https://[fe80::1]/", true],
+    ["https://172.15.0.1/", false],
+    ["https://172.32.0.1/", false],
+    ["https://8.8.8.8/", false],
+    ["https://[::ffff:808:808]/", false],
+    ["https://[fc::1]/", false],
+    ["https://[2001:db8::1]/", false],
+    ["https://example.com/", false],
+    ["https://localhost.example.com/", false],
+  ])("%s -> %s", (url, expected) => {
+    expect(isPrivateHost(new URL(url).hostname)).toBe(expected);
   });
 });

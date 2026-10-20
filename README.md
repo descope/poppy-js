@@ -95,7 +95,7 @@ interface Store {
 
 The default `MemoryStore` loses everything on exit, so every restart starts new Sessions. In production, pass a store backed by encrypted storage. The SDK writes the new state before it uses a token response, so a crash cannot lose an Account Token the Company already rotated.
 
-Use one `PoppyAgent` per store in a process. The agent keeps one live Session per User and Company, but agents or processes that share a store do not coordinate, and can overwrite each other's Account Token. State is stored under the key `poppy:<clientId>:<issuer>:<userId>`. Call `agent.forget(company, userId)` to sign a User out at a Company and delete their state there.
+Use one `PoppyAgent` per store in a process. The agent keeps one live Session per User and Company, but agents or processes that share a store do not coordinate, and can overwrite each other's Account Token. State is stored under the key `poppy:<clientId>:<issuer>:<userId>`. Call `agent.forget(company, userId)` to revoke a User's Account Token at a Company and delete their state there. If revocation fails, it rejects and keeps the state so you can call it again.
 
 ## User IDs
 
@@ -112,6 +112,8 @@ A random ID per User per Company, stored by your agent, meets all three. The SDK
 - **Your signing key stays yours.** You pass the agent's private signing key in; the SDK never exports or stores it.
 - **DPoP keys are extractable.** The SDK generates one DPoP key pair per User per Company and keeps the private key in your `Store` as a JWK, so a Session survives a restart. Protect the store accordingly.
 - **Tokens go only where they belong.** `session.fetch` requires `https` and a host that is the Company's domain, one of its subdomains, or a host listed in its `poppy.json` APIs or Company Agent. Redirects are returned to you, never followed with the token.
+- **No private addresses.** Discovery refuses a Company URL or redirect whose host is loopback, private or link-local (`localhost`, `10.x`, `192.168.x`, `169.254.x`, `::1` and similar). Pass `allowPrivateAddresses: true` to allow them, for tests. A DNS name that resolves to such an address is not caught.
+- **Sign-in links are checked.** Device Sign-In refuses a `verification_uri` whose host is not the issuer's or a `poppy_domains` entry, or a subdomain of either.
 - **Secrets stay out of errors and logs.** Session Tokens, Account Tokens, device codes and assertions are held in private fields. Errors carry only the status, error code and description.
 - **A replaced Account Token is not revoked.** When Device Sign-In replaces an existing Account Token, the spec suggests revoking the old one (4.4). The SDK does not do this yet; call `signOut()` first if you need it.
 

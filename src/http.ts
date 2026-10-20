@@ -16,14 +16,59 @@ export function httpsUrl(value: unknown, what: string): URL {
   return url;
 }
 
-/** Follows up to five redirects, each of which must stay on https (spec 3). */
+function isPrivateIpv4([a = 0, b = 0]: number[]): boolean {
+  return (
+    a === 0 ||
+    a === 10 ||
+    a === 127 ||
+    (a === 169 && b === 254) ||
+    (a === 172 && b >= 16 && b <= 31) ||
+    (a === 192 && b === 168)
+  );
+}
+
+/**
+ * Loopback, private and link-local addresses and `localhost` (spec 3). Takes a WHATWG URL hostname, which is
+ * already normalized (`0x7f.1` becomes `127.0.0.1`, `::ffff:127.0.0.1` becomes `[::ffff:7f00:1]`).
+ * ponytail: checks the name only; a DNS name that resolves to a private address is not caught.
+ */
+export function isPrivateHost(hostname: string): boolean {
+  const host = hostname
+    .toLowerCase()
+    .replace(/^\[|\]$/g, "")
+    .replace(/\.$/, "");
+  if (host === "localhost" || host.endsWith(".localhost")) return true;
+  if (/^[\d.]+$/.test(host)) return isPrivateIpv4(host.split(".").map(Number));
+  const mapped = /^::ffff:([\da-f]{1,4}):[\da-f]{1,4}$/.exec(host);
+  if (mapped !== null) {
+    const high = Number.parseInt(mapped[1] ?? "", 16);
+    return isPrivateIpv4([high >> 8, high & 0xff]);
+  }
+  return (
+    host === "::" ||
+    host === "::1" ||
+    /^f[cd][\da-f]{2}:/.test(host) ||
+    /^fe[89ab][\da-f]:/.test(host)
+  );
+}
+
+/** Refuses a private address unless `allowPrivate` (spec 3). */
+export function checkPublicHost(url: URL, what: string, allowPrivate: boolean): void {
+  if (!allowPrivate && isPrivateHost(url.hostname)) {
+    throw new PoppyProtocolError(`${what} host ${url.hostname} is a private address`);
+  }
+}
+
+/** Follows up to five redirects, each of which must stay on https and off private addresses (spec 3). */
 export async function getJson(
   fetchFn: Fetch,
   url: URL,
   what: string,
+  allowPrivate = false,
 ): Promise<{ body: unknown; url: URL }> {
   let current = url;
   for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
+    checkPublicHost(current, what, allowPrivate);
     const response = await fetchFn(current, {
       redirect: "manual",
       headers: { accept: "application/json" },

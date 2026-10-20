@@ -31,6 +31,8 @@ export interface PoppyAgentOptions {
   store?: Store;
   /** Defaults to the global `fetch`. Every request is sent with `redirect: "manual"`. */
   fetch?: Fetch;
+  /** Allow loopback, private and link-local Company hosts, as in tests. Off by default (spec 3). */
+  allowPrivateAddresses?: boolean;
 }
 
 interface PersistedState {
@@ -70,6 +72,52 @@ function parseTokenResponse(body: unknown): TokenResponse {
   };
 }
 
+interface ClientContext {
+  clientId: string;
+  company: Company;
+  signingKey: SigningKey;
+  fetch: Fetch;
+}
+
+function signAssertion(
+  { clientId, company, signingKey }: ClientContext,
+  sub: string,
+): Promise<string> {
+  const iat = nowSeconds();
+  return signJwt(
+    { typ: "JWT", kid: signingKey.kid },
+    {
+      iss: clientId,
+      sub,
+      aud: company.issuer,
+      iat,
+      exp: iat + ASSERTION_LIFETIME,
+      jti: randomId(),
+    },
+    signingKey.privateKey,
+  );
+}
+
+async function clientAuth(context: ClientContext): Promise<Record<string, string>> {
+  return {
+    client_id: context.clientId,
+    client_assertion_type: CLIENT_ASSERTION_TYPE,
+    client_assertion: await signAssertion(context, context.clientId),
+  };
+}
+
+/** Revokes an Account Token (spec 4.9). Needs no DPoP proof, so it works without a Session. */
+async function revokeAccountToken(context: ClientContext, token: string): Promise<void> {
+  const body = new URLSearchParams({
+    token,
+    token_type_hint: "refresh_token",
+    ...(await clientAuth(context)),
+  });
+  const response = await postForm(context.fetch, context.company.revocationEndpoint, body);
+  if (!response.ok) throw await errorFromResponse(response);
+  await response.body?.cancel();
+}
+
 /** Reads the `error` attribute of `WWW-Authenticate`, such as `sign_in_required` (spec section 6). */
 export function wwwAuthenticateError(response: Response): string | undefined {
   return /\berror="([^"]*)"/.exec(response.headers.get("www-authenticate") ?? "")?.[1];
@@ -96,6 +144,7 @@ export class PoppyAgent {
   readonly #signingKey: SigningKey;
   readonly #store: Store;
   readonly #fetch: Fetch;
+  readonly #allowPrivateAddresses: boolean;
   readonly #sessions = new Map<string, Promise<Session>>();
   /**
    * Opening a User waits for its in-flight {@link forget} and fails if it failed, so it never reuses state
@@ -111,11 +160,15 @@ export class PoppyAgent {
     this.#signingKey = options.signingKey;
     this.#store = options.store ?? new MemoryStore();
     this.#fetch = options.fetch ?? fetch;
+    this.#allowPrivateAddresses = options.allowPrivateAddresses ?? false;
   }
 
-  /** Like {@link discover}, using this agent's `fetch`. */
+  /** Like {@link discover}, using this agent's `fetch` and `allowPrivateAddresses`. */
   discover(website: string): Promise<Company> {
-    return discover(website, { fetch: this.#fetch });
+    return discover(website, {
+      fetch: this.#fetch,
+      allowPrivateAddresses: this.#allowPrivateAddresses,
+    });
   }
 
   /**
@@ -144,16 +197,17 @@ export class PoppyAgent {
   }
 
   /**
-   * Signs the Session out if signed in, then deletes the stored state for `userId` at `company`.
+   * Revokes the stored Account Token if there is one, then deletes the stored state for `userId` at `company`.
    * Sessions opened earlier stop working; the next {@link session} call starts a new, signed-out one.
-   * A failed sign-out does not stop the deletion.
+   * If revocation fails, rejects and keeps the stored state, so the token is not lost while still valid;
+   * call again to retry.
    */
   forget(company: Company, userId: string): Promise<void> {
     const storeKey = this.#storeKey(company, userId);
     const open = this.#sessions.get(storeKey);
     this.#sessions.delete(storeKey);
     const previous = this.#forgetting.get(storeKey)?.catch(() => undefined) ?? Promise.resolve();
-    const forgetting = previous.then(() => this.#erase(company, userId, storeKey, open));
+    const forgetting = previous.then(() => this.#erase(company, storeKey, open));
     this.#forgetting.set(storeKey, forgetting);
     void forgetting
       .catch(() => undefined)
@@ -165,16 +219,27 @@ export class PoppyAgent {
 
   async #erase(
     company: Company,
-    userId: string,
     storeKey: string,
     open: Promise<Session> | undefined,
   ): Promise<void> {
-    let session = await open?.catch(() => undefined);
-    if (open === undefined && (await this.#hasAccountToken(storeKey))) {
-      // Without an Account Token there is nothing to revoke; opening a Session would create one.
-      session = await this.#openSession(company, userId, storeKey).catch(() => undefined);
+    const session = await open?.catch(() => undefined);
+    if (session !== undefined) {
+      // Queued behind the Session's own token requests, so it revokes the latest rotated Account Token.
+      await closeSession(session);
+    } else {
+      const token = await this.#storedAccountToken(storeKey);
+      if (token !== undefined) {
+        await revokeAccountToken(
+          {
+            clientId: this.clientId,
+            company,
+            signingKey: this.#signingKey,
+            fetch: this.#fetch,
+          },
+          token,
+        );
+      }
     }
-    if (session !== undefined) await closeSession(session).catch(() => undefined);
     await this.#store.delete(storeKey);
   }
 
@@ -182,13 +247,14 @@ export class PoppyAgent {
     return `poppy:${this.clientId}:${company.issuer}:${userId}`;
   }
 
-  async #hasAccountToken(storeKey: string): Promise<boolean> {
+  async #storedAccountToken(storeKey: string): Promise<string | undefined> {
     const stored = await this.#store.get(storeKey);
-    if (stored === undefined) return false;
+    if (stored === undefined) return undefined;
     try {
-      return (JSON.parse(stored) as PersistedState).accountToken !== undefined;
+      return (JSON.parse(stored) as PersistedState).accountToken;
     } catch {
-      return false;
+      // Unreadable state holds no token we can revoke.
+      return undefined;
     }
   }
 
@@ -320,7 +386,7 @@ export class Session {
   }
 
   async #assertionParams(): Promise<Record<string, string>> {
-    const assertion = await this.#signAssertion(this.#init.userId);
+    const assertion = await signAssertion(this.#init, this.#init.userId);
     return { grant_type: JWT_BEARER, assertion, ...this.#sessionParam() };
   }
 
@@ -334,32 +400,6 @@ export class Session {
 
   #sessionParam(): Record<string, string> {
     return this.#state.sessionId === undefined ? {} : { session_id: this.#state.sessionId };
-  }
-
-  async #clientAuth(): Promise<Record<string, string>> {
-    const { clientId } = this.#init;
-    return {
-      client_id: clientId,
-      client_assertion_type: CLIENT_ASSERTION_TYPE,
-      client_assertion: await this.#signAssertion(clientId),
-    };
-  }
-
-  async #signAssertion(sub: string): Promise<string> {
-    const { clientId, company, signingKey } = this.#init;
-    const iat = nowSeconds();
-    return signJwt(
-      { typ: "JWT", kid: signingKey.kid },
-      {
-        iss: clientId,
-        sub,
-        aud: company.issuer,
-        iat,
-        exp: iat + ASSERTION_LIFETIME,
-        jti: randomId(),
-      },
-      signingKey.privateKey,
-    );
   }
 
   #rememberNonce(url: string, response: Response): void {
@@ -376,7 +416,7 @@ export class Session {
         url,
         nonce === undefined ? {} : { nonce },
       );
-      const body = new URLSearchParams({ ...(await params()), ...(await this.#clientAuth()) });
+      const body = new URLSearchParams({ ...(await params()), ...(await clientAuth(this.#init)) });
       const response = await postForm(this.#init.fetch, url, body, { dpop: proof });
       this.#rememberNonce(url, response);
       if (response.ok) {
@@ -509,7 +549,10 @@ export class Session {
         description: `request scopes from: ${deviceScopes.join(" ")}`,
       });
     }
-    const body = new URLSearchParams({ scope: requested.join(" "), ...(await this.#clientAuth()) });
+    const body = new URLSearchParams({
+      scope: requested.join(" "),
+      ...(await clientAuth(this.#init)),
+    });
     const response = await postForm(this.#init.fetch, deviceAuthorizationEndpoint, body);
     if (!response.ok) throw await errorFromResponse(response);
     const data: unknown = await response.json().catch(() => undefined);
@@ -533,11 +576,11 @@ export class Session {
     return new DeviceSignIn(
       {
         userCode: user_code,
-        verificationUri: httpsUrl(verification_uri, "verification_uri").href,
+        verificationUri: this.#signInUrl(verification_uri, "verification_uri"),
         verificationUriComplete:
           verification_uri_complete === undefined
             ? undefined
-            : httpsUrl(verification_uri_complete, "verification_uri_complete").href,
+            : this.#signInUrl(verification_uri_complete, "verification_uri_complete"),
         expiresIn: expires_in,
         interval: typeof interval === "number" && interval > 0 ? interval : 5,
       },
@@ -560,10 +603,22 @@ export class Session {
       (token) =>
         this.#serial(async () => {
           if (this.#signOuts === signOuts) return this.#applyToken(token, requested.join(" "));
-          if (token.refreshToken !== undefined) await this.#revoke(token.refreshToken);
+          if (token.refreshToken !== undefined)
+            await revokeAccountToken(this.#init, token.refreshToken);
           throw new PoppyProtocolError("the Session signed out during Device Sign-In");
         }),
     );
+  }
+
+  /** The User's sign-in link must be on the issuer host or a `poppy_domains` entry, or a subdomain. */
+  #signInUrl(value: unknown, what: string): string {
+    const url = httpsUrl(value, what);
+    const host = url.hostname;
+    const allowed = [new URL(this.company.issuer).hostname, ...this.company.poppyDomains];
+    if (!allowed.some((domain) => host === domain || host.endsWith(`.${domain}`))) {
+      throw new PoppyProtocolError(`${what} host ${host} is not the issuer or in poppy_domains`);
+    }
+    return url.href;
   }
 
   /**
@@ -578,19 +633,8 @@ export class Session {
     this.#signOuts += 1;
     const token = this.#state.accountToken;
     if (token === undefined) return;
-    await this.#revoke(token);
+    await revokeAccountToken(this.#init, token);
     await this.#forgetAccount();
-  }
-
-  async #revoke(token: string): Promise<void> {
-    const body = new URLSearchParams({
-      token,
-      token_type_hint: "refresh_token",
-      ...(await this.#clientAuth()),
-    });
-    const response = await postForm(this.#init.fetch, this.company.revocationEndpoint, body);
-    if (!response.ok) throw await errorFromResponse(response);
-    await response.body?.cancel();
   }
 
   static {

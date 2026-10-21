@@ -52,6 +52,7 @@ export function isPrivateHost(hostname: string): boolean {
   return (
     host === "::" ||
     host === "::1" ||
+    host.startsWith("64:ff9b:1:") ||
     /^f[cd][\da-f]{2}:/.test(host) ||
     /^fe[89a-f][\da-f]:/.test(host)
   );

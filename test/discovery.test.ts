@@ -236,6 +236,7 @@ describe("isPrivateHost", () => {
     ["https://[::127.0.0.1]/", true],
     ["https://[::ffff:0:7f00:1]/", true],
     ["https://[64:ff9b::a9fe:a9fe]/", true],
+    ["https://[64:ff9b:1::a00:1]/", true],
     ["https://[2002:7f00:1::]/", true],
     ["https://[2002:a00::]/", true],
     ["https://100.128.0.1/", false],

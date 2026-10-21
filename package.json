@@ -1,0 +1,57 @@
+{
+  "name": "@descope/poppy",
+  "version": "0.0.0",
+  "description": "TypeScript client for the Personal Agent Protocol (Poppy): discovery, Sessions, Device Sign-In and DPoP-bound API calls.",
+  "keywords": [
+    "agent",
+    "dpop",
+    "oauth",
+    "personal-agent",
+    "poppy"
+  ],
+  "homepage": "https://github.com/descope/poppy-js#readme",
+  "bugs": {
+    "url": "https://github.com/descope/poppy-js/issues"
+  },
+  "license": "Apache-2.0",
+  "author": "Descope",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/descope/poppy-js.git"
+  },
+  "files": [
+    "dist"
+  ],
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "lint": "oxlint --deny-warnings",
+    "format": "oxfmt",
+    "format:check": "oxfmt --check",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@types/node": "24.19.2",
+    "@vitest/coverage-v8": "5.0.5",
+    "oxfmt": "0.73.0",
+    "oxlint": "1.88.0",
+    "typescript": "7.0.2",
+    "vitest": "5.0.5"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "packageManager": "pnpm@11.1.2"
+}

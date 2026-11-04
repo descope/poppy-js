@@ -402,6 +402,31 @@ describe("tokens", () => {
     expect(business.userId).toBe(user.userId);
     expect(business.signedIn).toBe(false);
   });
+
+  it("drops a pending sign-in on sign-out, so a late callback can't sign back in", async () => {
+    const { mock, user } = await setup();
+    const { url } = await user.startDirectSignIn({ scope: "orders:read" });
+    await user.signOut();
+    await expect(user.completeDirectSignIn(await mock.approve(url))).rejects.toThrow("state");
+    expect(user.signedIn).toBe(false);
+  });
+
+  it("forgetting User IDs drops every account's cached users", async () => {
+    const { mock, agent, company, user } = await setup();
+    await signIn(mock, user);
+    const business = await agent.user(company, "alice", { account: "business" });
+    await agent.forget(company, "alice", { userIds: true });
+    const after = await agent.user(company, "alice", { account: "business" });
+    expect(after).not.toBe(business);
+    expect(after.userId).not.toBe(user.userId);
+  });
+
+  it("refuses to send a request to a private host", async () => {
+    const { user } = await setup();
+    await expect(user.session().fetch("https://10.0.0.5/v1/orders")).rejects.toThrow(
+      "private address",
+    );
+  });
 });
 
 describe("Operations extension", () => {

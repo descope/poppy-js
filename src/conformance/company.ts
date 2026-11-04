@@ -406,7 +406,8 @@ export class ConformanceCompany {
     const iat = Number(payload["iat"]);
     const exp = Number(payload["exp"]);
     if (!Number.isFinite(iat)) return fail("no iat");
-    if (Number.isFinite(exp) && exp - iat > 300) return fail("the assertion lives over 5 minutes");
+    if (!Number.isFinite(exp) || exp <= Date.now() / 1000) return fail("exp is missing or past");
+    if (exp - iat > 300) return fail("the assertion lives over 5 minutes");
     const jti = payload["jti"];
     if (typeof jti !== "string" || jti.length < 16) return fail("jti is missing or guessable");
     if (this.#assertionJtis.has(jti)) return fail("a jti was reused");
@@ -604,7 +605,7 @@ export class ConformanceCompany {
 
     if (value !== undefined) {
       const token = this.#access.get(value);
-      if (token === undefined || token.revoked)
+      if (token === undefined || token.revoked || this.#rejectedTokens.has(value))
         return challenge(scheme, 'error="invalid_token"', resource);
       if (token.scope.includes("orders:admin")) {
         this.fail("oauth.extra-scopes", "used a token that granted a scope it didn't request");

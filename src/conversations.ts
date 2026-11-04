@@ -353,9 +353,11 @@ export class Conversations {
     url: string,
     body: Record<string, unknown> | undefined,
     headers: Record<string, string> = {},
+    signal?: AbortSignal,
   ): Promise<Record<string, unknown>> {
     const response = await this.session.fetch(url, {
       method,
+      ...(signal === undefined ? {} : { signal }),
       headers: {
         accept: "application/json",
         ...(body === undefined ? {} : { "content-type": "application/json" }),
@@ -477,13 +479,15 @@ export class Conversation {
    * Reads one page of events after the cursor (spec 8.5), holding up to `wait` seconds for one. On
    * `cursor_expired`, reads from the beginning and skips events already handled.
    */
-  async read(options: { wait?: number } = {}): Promise<ConversationUpdate> {
+  async read(options: { wait?: number; signal?: AbortSignal } = {}): Promise<ConversationUpdate> {
     try {
       return this.apply(
         await this.#conversations.request(
           "GET",
           withQuery(`${this.#url}/events`, { cursor: this.#cursor, wait: options.wait }),
           undefined,
+          {},
+          options.signal,
         ),
       );
     } catch (error) {
@@ -581,7 +585,10 @@ export class Conversation {
         let update = this.apply(json);
         for (const event of update.events) yield { type: "event", event };
         while ((update.hasMore || update.status !== "closed") && !signal?.aborted) {
-          update = await this.read({ wait: update.hasMore ? 0 : POLL_WAIT });
+          update = await this.read({
+            wait: update.hasMore ? 0 : POLL_WAIT,
+            ...(signal === undefined ? {} : { signal }),
+          });
           for (const event of update.events) yield { type: "event", event };
         }
         return;

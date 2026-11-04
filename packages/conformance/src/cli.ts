@@ -75,6 +75,7 @@ async function agent(flags: Map<string, string[]>): Promise<number> {
   });
   await harness.start();
   const results: ScenarioResult[] = [];
+  const crashed: string[] = [];
   try {
     for (const scenario of scenarios) {
       const run = await harness.run(scenario, command, { timeoutMs });
@@ -88,6 +89,7 @@ async function agent(flags: Map<string, string[]>): Promise<number> {
       writeFileSync(join(dir, "stdout.txt"), run.stdout);
       writeFileSync(join(dir, "stderr.txt"), run.stderr);
       const failed = run.result.checks.filter((c) => c.status === "fail").length;
+      if (run.timedOut || run.exitCode !== 0) crashed.push(scenario.name);
       console.log(
         `${failed === 0 ? "ok  " : "FAIL"}  ${scenario.name} (${run.result.checks.length} checks${failed === 0 ? "" : `, ${failed} failed`})`,
       );
@@ -101,6 +103,7 @@ async function agent(flags: Map<string, string[]>): Promise<number> {
   }
 
   const report = summarize(results);
+  if (crashed.length > 0) console.log(`\nAgent crashed or timed out in: ${crashed.join(", ")}`);
   console.log(`\n${formatReport(report)}`);
   const baselineFile = flags.get("expected-failures")?.[0];
   if (baselineFile !== undefined) {
@@ -111,10 +114,12 @@ async function agent(flags: Map<string, string[]>): Promise<number> {
       console.log(`Unexpected failures: ${outcome.unexpected.join(", ")}`);
     if (outcome.stale.length > 0)
       console.log(`Stale baseline entries, which pass now: ${outcome.stale.join(", ")}`);
-    return outcome.exitCode;
+    return crashed.length > 0 ? 1 : outcome.exitCode;
   }
   // A failed MUST fails the run. A failed SHOULD is reported, and doesn't.
-  return report.results.some((r) => r.status === "fail" && r.level === "MUST") ? 1 : 0;
+  return crashed.length > 0 || report.results.some((r) => r.status === "fail" && r.level === "MUST")
+    ? 1
+    : 0;
 }
 
 async function main(): Promise<number> {

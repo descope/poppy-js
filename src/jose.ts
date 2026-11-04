@@ -51,14 +51,17 @@ export interface SigningKey {
 
 export function signerFromKey({ privateKey, kid }: SigningKey): Signer {
   const name = privateKey.algorithm.name;
-  if (name === "ECDSA") {
+  if (name === "ECDSA" && (privateKey.algorithm as EcKeyAlgorithm).namedCurve === "P-256") {
     return {
       kid,
       alg: "ES256",
       sign: async (input) => new Uint8Array(await crypto.subtle.sign(ES256, privateKey, input)),
     };
   }
-  if (name === "RSA-PSS") {
+  if (
+    name === "RSA-PSS" &&
+    (privateKey.algorithm as RsaHashedKeyAlgorithm).hash.name === "SHA-384"
+  ) {
     return {
       kid,
       alg: "PS384",
@@ -69,7 +72,7 @@ export function signerFromKey({ privateKey, kid }: SigningKey): Signer {
         ),
     };
   }
-  throw new TypeError(`signing key must be ECDSA P-256 or RSA-PSS, not ${name}`);
+  throw new TypeError(`signing key must be ECDSA P-256 or RSA-PSS SHA-384, not ${name}`);
 }
 
 function encodePart(value: Record<string, unknown>): string {

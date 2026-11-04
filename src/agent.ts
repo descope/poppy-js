@@ -198,13 +198,21 @@ export class PoppyAgent {
   ): Promise<void> {
     const { userIds, ...userOptions } = options;
     const user = await this.user(company, localUserId, userOptions);
-    await user.accountFor().forget();
     const account = userOptions.account ?? "default";
+    if (company.oauth !== undefined) {
+      await user.accountFor().forget();
+      await this.dropPendingSignIns(company.identifier, localUserId, account);
+    }
     this.#accounts.delete(this.#accountKey(company, localUserId, account));
     // Every PoppyUser for this account, whatever its agent name or domain, held the forgotten Account.
+    // Deleted User IDs are shared by all accounts, so then every account's PoppyUsers go.
     for (const key of this.#users.keys()) {
       const [identifier, local, name] = JSON.parse(key) as unknown[];
-      if (identifier === company.identifier && local === localUserId && name === account)
+      if (
+        identifier === company.identifier &&
+        local === localUserId &&
+        (name === account || userIds === true)
+      )
         this.#users.delete(key);
     }
     if (userIds === true) {
@@ -311,6 +319,37 @@ export class PoppyAgent {
         if (pending !== state) await this.#store.delete(`${PENDING_PREFIX}${pending}`);
       }
       if (expiresAt !== undefined) index[state] = expiresAt;
+      await this.#store.set(indexKey, JSON.stringify(index));
+    });
+    this.#pendingIndex = run.catch(() => undefined);
+    return run;
+  }
+
+  /**
+   * @internal Deletes the pending Direct Sign-Ins an account started, so a callback that arrives after
+   * sign-out or forget can't sign it back in.
+   */
+  dropPendingSignIns(identifier: string, localUserId: string, account: string): Promise<void> {
+    const indexKey = `${PENDING_PREFIX}index`;
+    const run = this.#pendingIndex.then(async () => {
+      const stored = await this.#store.get(indexKey);
+      if (stored === undefined) return;
+      const index = JSON.parse(stored) as Record<string, number>;
+      for (const state of Object.keys(index)) {
+        const key = `${PENDING_PREFIX}${state}`;
+        const value = await this.#store.get(key);
+        if (value !== undefined) {
+          const record = JSON.parse(value) as PendingDirectSignIn;
+          if (
+            record.identifier !== identifier ||
+            record.localUserId !== localUserId ||
+            record.account !== account
+          )
+            continue;
+          await this.#store.delete(key);
+        }
+        delete index[state];
+      }
       await this.#store.set(indexKey, JSON.stringify(index));
     });
     this.#pendingIndex = run.catch(() => undefined);
@@ -500,6 +539,12 @@ export class PoppyUser {
 
   /** Signs out (spec 5.5): revokes the refresh token. Sessions continue signed out. */
   async signOut(): Promise<void> {
-    if (this.#init.account !== undefined) await this.#init.account.signOut();
+    if (this.#init.account === undefined) return;
+    await this.#init.account.signOut();
+    await this.#agent.dropPendingSignIns(
+      this.company.identifier,
+      this.#init.localUserId ?? "",
+      this.#init.accountName ?? "default",
+    );
   }
 }

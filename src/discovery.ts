@@ -472,7 +472,8 @@ export async function discover(website: string, options: DiscoverOptions = {}): 
   const apis = parseApis(doc["apis"]);
   const extensions = parseExtensions(doc["extensions"]);
   const mediated =
-    !disabled && oauth?.grantTypesSupported.includes(MEDIATED_SIGN_IN_GRANT) === true
+    !disabled &&
+    oauth?.grantTypesSupported.some((grant) => grant === MEDIATED_SIGN_IN_GRANT) === true
       ? parseMediated(extensions["mediated-sign-in"])
       : undefined;
   const browserSessionEndpoint = optionalUrl(

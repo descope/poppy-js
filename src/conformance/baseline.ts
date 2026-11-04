@@ -20,7 +20,8 @@ export function parseBaseline(text: string): Baseline {
   const entries: string[] = [];
   let inAgent = false;
   for (const raw of text.split(/\r?\n/)) {
-    const line = raw.replace(/\s+#.*$/, "").trimEnd();
+    const comment = raw.search(/\s#/);
+    const line = (comment === -1 ? raw : raw.slice(0, comment)).trimEnd();
     if (line.trim() === "" || line.trim().startsWith("#")) continue;
     if (/^\S/.test(line)) {
       if (!/^agent:\s*$/.test(line)) throw new Error(`unexpected key in baseline: ${line}`);

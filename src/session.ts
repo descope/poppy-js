@@ -3,7 +3,7 @@ import { authChallenge } from "./challenge.ts";
 import { Conversations } from "./conversations.ts";
 import type { Company } from "./discovery.ts";
 import { errorFromResponse, PoppyError, PoppyProtocolError } from "./errors.ts";
-import { type Fetch, getJson, httpsUrl, isObject } from "./http.ts";
+import { checkPublicHost, type Fetch, getJson, httpsUrl, isObject } from "./http.ts";
 import { randomId } from "./jose.ts";
 import { type Approval, approvalHeader } from "./operations.ts";
 import { type OperatorSignatureOptions, signOperator } from "./operator.ts";
@@ -107,6 +107,7 @@ export class Session {
   async fetch(input: string | URL, init: SessionFetchInit = {}): Promise<Response> {
     if (this.#ended) throw new PoppyProtocolError("this Session has ended");
     const url = httpsUrl(String(input), "request URL");
+    checkPublicHost(url, "request URL", this.#init.allowPrivateAddresses);
     if (!(await this.#init.resolver.isDestination(url)))
       throw new PoppyProtocolError(
         `${url.origin}${url.pathname} is not an API or endpoint ${this.company.domain} lists`,

@@ -285,3 +285,12 @@ describe("addresses", () => {
     expect(isPrivateHost(host)).toBe(expected);
   });
 });
+
+describe("signing keys", () => {
+  it("refuses an ECDSA key that isn't P-256", async () => {
+    const pair = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-384" }, false, [
+      "sign",
+    ]);
+    expect(() => signerFromKey({ privateKey: pair.privateKey, kid: "k1" })).toThrow("P-256");
+  });
+});

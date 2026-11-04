@@ -165,7 +165,9 @@ export class Account {
       return cached.then((token) =>
         token !== undefined && Date.now() < token.expiresAt - EXPIRY_MARGIN
           ? token
-          : this.#refreshInto(key, choice),
+          : this.#tokens.get(key) !== cached
+            ? this.accessToken(choice)
+            : this.#refreshInto(key, choice),
       );
     }
     return this.#refreshInto(key, choice);

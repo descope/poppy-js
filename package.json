@@ -1,13 +1,17 @@
 {
   "name": "@descope/poppy",
   "version": "0.0.0",
-  "description": "TypeScript client for the Personal Agent Protocol (Poppy): discovery, Sessions, Device Sign-In and DPoP-bound API calls.",
+  "description": "TypeScript Personal Agent SDK for the Personal Agent Protocol (Poppy) draft 0.3: discovery, delegated Session JWTs, Direct, Device and Mediated Sign-In, APIs, browser join, conversations, task coverage and operations.",
   "keywords": [
     "agent",
+    "agents",
     "dpop",
+    "mcp",
     "oauth",
     "personal-agent",
-    "poppy"
+    "personal-agent-protocol",
+    "poppy",
+    "sdk"
   ],
   "homepage": "https://github.com/descope/poppy-js#readme",
   "bugs": {
@@ -29,22 +33,28 @@
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
     },
+    "./conformance": {
+      "types": "./dist/conformance/index.d.ts",
+      "default": "./dist/conformance/index.js"
+    },
     "./package.json": "./package.json"
   },
   "publishConfig": {
     "access": "public"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
+    "build": "tsc -p tsconfig.build.json && pnpm --filter @descope/poppy-conformance run build",
     "typecheck": "tsc --noEmit",
     "lint": "oxlint --deny-warnings",
     "format": "oxfmt",
     "format:check": "oxfmt --check",
-    "test": "vitest run"
+    "test": "vitest run",
+    "conformance": "node packages/conformance/src/cli.ts agent --command \"node examples/conformance-agent.ts\""
   },
   "devDependencies": {
     "@types/node": "24.19.2",
     "@vitest/coverage-v8": "5.0.5",
+    "ai": "7.0.150",
     "oxfmt": "0.73.0",
     "oxlint": "1.88.0",
     "typescript": "7.0.2",

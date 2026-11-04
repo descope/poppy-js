@@ -34,3 +34,7 @@ jobs:
       - run: pnpm run typecheck
       - run: pnpm run test
       - run: pnpm run build
+      - name: Conformance
+        if: matrix.node == 24
+        # Runs this SDK's everything-agent through the CLI, as another SDK would run its own.
+        run: pnpm run conformance

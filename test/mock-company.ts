@@ -1,94 +1,55 @@
-import { expect } from "vitest";
-import { PoppyAgent, type SigningKey, type Store } from "../src/index.ts";
+import { decodeJwt, thumbprint } from "../src/jose.ts";
 
 /**
- * In-memory Company that enforces what the spec requires of one: ES256 signatures on assertions and DPoP
- * Proofs, `aud` equal to the issuer, single-use `jti`, DPoP `htm`/`htu`/`ath`/`nonce`, and tokens bound to the
- * RFC 7638 thumbprint.
+ * An in-memory Company with a working OAuth server, for signed-in flows the conformance fake doesn't
+ * cover. It verifies client assertions, delegations, Session JWTs (including `ath`), PKCE and DPoP proofs,
+ * and issues, rotates and revokes tokens.
  */
-export const WEBSITE = "https://example.com";
-export const ISSUER = "https://auth.example.com/tenants/t1";
-export const METADATA_URL =
-  "https://auth.example.com/.well-known/oauth-authorization-server/tenants/t1";
-export const TOKEN_ENDPOINT = "https://auth.example.com/token";
-export const DEVICE_ENDPOINT = "https://auth.example.com/device";
-export const REVOCATION_ENDPOINT = "https://auth.example.com/revoke";
+export const DOMAIN = "example.com";
+export const ISSUER = "https://auth.example.com";
 export const API = "https://api.example.com";
-export const CLIENT_ID = "https://agent.example.net/client.json";
-export const USER_ID = "usr_7Fq2";
+export const MCP = "https://mcp.example.com/mcp";
+export const CONVERSATIONS = "https://api.example.com/poppy/conversations";
+export const CLIENT_ID = "https://agent.example/agent.json";
 
-const ES256 = { name: "ECDSA", namedCurve: "P-256", hash: "SHA-256" } as const;
-const decoder = new TextDecoder();
+const ES256 = { name: "ECDSA", hash: "SHA-256" } as const;
+const P256 = { name: "ECDSA", namedCurve: "P-256" } as const;
+const encoder = new TextEncoder();
 
-export interface Call {
-  method: string;
-  url: string;
-  headers: Headers;
-  form: URLSearchParams | undefined;
-  /** `Date.now()` when the call was made. */
-  at: number;
+export interface MockOptions {
+  /** Token type the server issues; `DPoP` also requires a proof. */
+  tokenType?: "Bearer" | "DPoP";
+  /** Return a new refresh token on every refresh. */
+  rotate?: boolean;
+  /** Grant fewer scopes than requested at sign-in. */
+  grantOnly?: string[];
+  /** Require a DPoP nonce on the first token request. */
+  dpopNonce?: boolean;
+  /** Mediated Sign-In asks for a one-time code. */
+  mediatedCode?: boolean;
+  /** Changes the `poppy.json` the Company serves. */
+  poppy?: (doc: Record<string, unknown>) => Record<string, unknown>;
 }
 
-type DevicePoll =
-  | "authorization_pending"
-  | "slow_down"
-  | "access_denied"
-  | "expired_token"
-  | "account_mismatch"
-  | "approve";
-
-interface Decoded {
-  header: Record<string, unknown>;
-  payload: Record<string, unknown>;
+export interface Issued {
+  value: string;
+  scope: string[];
+  resource: string | undefined;
+  revoked: boolean;
+  jkt: string | undefined;
 }
 
-export function poppyJson(): Record<string, unknown> {
-  return {
-    protocol_version: "0.1",
-    organization: { name: "Example", domain: "example.com" },
-    auth: {
-      issuer: ISSUER,
-      device: { scopes: ["poppy:read", "poppy:write"] },
-    },
-    apis: [{ type: "openapi", url: `${API}/openapi.json` }],
-  };
-}
-
-export function oauthMetadata(): Record<string, unknown> {
-  return {
-    issuer: ISSUER,
-    token_endpoint: TOKEN_ENDPOINT,
-    revocation_endpoint: REVOCATION_ENDPOINT,
-    device_authorization_endpoint: DEVICE_ENDPOINT,
-    dpop_signing_alg_values_supported: ["ES256"],
-    poppy_domains: ["example.com"],
-  };
-}
-
-function b64urlJson(part: string): Record<string, unknown> {
-  return JSON.parse(decoder.decode(Buffer.from(part, "base64url"))) as Record<string, unknown>;
-}
-
-async function verifyJws(jws: string, key: CryptoKey): Promise<Decoded> {
-  const [h, p, s] = jws.split(".");
-  if (h === undefined || p === undefined || s === undefined) throw new Error("not a JWS");
-  const ok = await crypto.subtle.verify(
-    ES256,
-    key,
-    Buffer.from(s, "base64url"),
-    new TextEncoder().encode(`${h}.${p}`),
-  );
-  if (!ok) throw new Error("bad signature");
-  return { header: b64urlJson(h), payload: b64urlJson(p) };
+async function verify(jwt: string, jwk: JsonWebKey): Promise<boolean> {
+  const [h, p, s] = jwt.split(".");
+  if (h === undefined || p === undefined || s === undefined) return false;
+  const key = await crypto.subtle.importKey("jwk", jwk, P256, false, ["verify"]);
+  return crypto.subtle.verify(ES256, key, Buffer.from(s, "base64url"), encoder.encode(`${h}.${p}`));
 }
 
 async function sha256(value: string): Promise<string> {
-  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
-  return Buffer.from(digest).toString("base64url");
-}
-
-export function thumbprint(jwk: JsonWebKey): Promise<string> {
-  return sha256(JSON.stringify({ crv: jwk.crv, kty: jwk.kty, x: jwk.x, y: jwk.y }));
+  return Buffer.from(await crypto.subtle.digest("SHA-256", encoder.encode(value))).toString(
+    "base64url",
+  );
 }
 
 function json(status: number, body: unknown, headers: Record<string, string> = {}): Response {
@@ -98,285 +59,392 @@ function json(status: number, body: unknown, headers: Record<string, string> = {
   });
 }
 
-function oauthError(error: string, status = 400, headers: Record<string, string> = {}): Response {
-  return json(status, { error, error_description: `mock: ${error}` }, headers);
-}
-
-class Rejected extends Error {
-  constructor(readonly response: Response) {
-    super("rejected");
-  }
-}
-
 export class MockCompany {
-  readonly calls: Call[] = [];
-  readonly signingKey: SigningKey;
-  readonly #publicKey: CryptoKey;
+  readonly options: MockOptions;
+  readonly agentKey: CryptoKeyPair;
+  agentJwk!: JsonWebKey;
+  readonly accessTokens = new Map<string, Issued>();
+  readonly refreshTokens = new Map<string, Issued>();
+  readonly revoked: string[] = [];
+  readonly requests: { method: string; url: string; headers: Headers; body: string }[] = [];
+  readonly sessionClaims: Record<string, unknown>[] = [];
+  readonly delegationJtis = new Set<string>();
+  readonly codes = new Map<string, { challenge: string; scope: string[]; redirectUri: string }>();
+  device: "pending" | "slow_down" | "approved" | "denied" = "pending";
+  deviceScope: string[] = [];
+  /** Fail the next resource request with invalid_token. */
+  rejectNextToken = false;
+  #counter = 0;
+  #nonceIssued = false;
 
-  /** Overrides for served documents and redirects, by URL. */
-  readonly routes = new Map<string, () => Response>();
-  poppy = poppyJson();
-  metadata = oauthMetadata();
-
-  /** `once`: demand a nonce until the agent sends the current one. `always`: a fresh nonce every time. */
-  tokenNonce: "off" | "once" | "always" = "off";
-  apiNonce: "off" | "once" | "always" = "off";
-  expiresIn = 3600;
-  /** Polls answered in order; the last one repeats. */
-  devicePolls: DevicePoll[] = ["approve"];
-  grantedScope: string | undefined;
-  rotateRefresh = false;
-  readonly endedSessions = new Set<string>();
-  /** Refresh tokens that answer `invalid_grant`. */
-  readonly revokedRefresh = new Set<string>();
-  /** Access tokens that answer `invalid_token` at the API. */
-  readonly invalidAccess = new Set<string>();
-
-  readonly #seenJti = new Set<string>();
-  readonly #accessTokens = new Map<string, { jkt: string; signedIn: boolean }>();
-  readonly #refreshTokens = new Map<string, string>();
-  #nonceCounter = 0;
-  #tokenNonce = "";
-  #apiNonce = "";
-  #sessionCounter = 0;
-  #tokenCounter = 0;
-  #devicePoll = 0;
-  /** Every refresh token issued, for leak checks. */
-  readonly issuedSecrets: string[] = [];
-
-  private constructor(signingKey: SigningKey, publicKey: CryptoKey) {
-    this.signingKey = signingKey;
-    this.#publicKey = publicKey;
+  constructor(agentKey: CryptoKeyPair, options: MockOptions = {}) {
+    this.agentKey = agentKey;
+    this.options = options;
   }
 
-  static async create(): Promise<MockCompany> {
-    const pair = await crypto.subtle.generateKey(ES256, true, ["sign", "verify"]);
-    return new MockCompany({ privateKey: pair.privateKey, kid: "agent-key-1" }, pair.publicKey);
+  static async create(options: MockOptions = {}): Promise<MockCompany> {
+    const pair = await crypto.subtle.generateKey(P256, true, ["sign", "verify"]);
+    const company = new MockCompany(pair, options);
+    company.agentJwk = await crypto.subtle.exportKey("jwk", pair.publicKey);
+    return company;
   }
 
-  agent(options: { store?: Store } = {}): PoppyAgent {
-    return new PoppyAgent({
-      clientId: CLIENT_ID,
-      signingKey: this.signingKey,
-      fetch: this.fetch,
-      ...options,
-    });
-  }
-
-  callsTo(url: string): Call[] {
-    return this.calls.filter((call) => call.url === url);
-  }
-
-  fetch = async (input: string | URL | Request, init: RequestInit = {}): Promise<Response> => {
-    expect(init.redirect).toBe("manual");
-    const url = String(input);
-    const method = init.method ?? "GET";
-    const headers = new Headers(init.headers);
-    const form = init.body instanceof URLSearchParams ? init.body : undefined;
-    this.calls.push({ method, url, headers, form, at: Date.now() });
-    try {
-      return await this.#route(method, url, headers, form);
-    } catch (error) {
-      if (error instanceof Rejected) return error.response;
-      throw error;
-    }
-  };
-
-  async #route(
-    method: string,
-    url: string,
-    headers: Headers,
-    form: URLSearchParams | undefined,
-  ): Promise<Response> {
-    const override = this.routes.get(url);
-    if (override !== undefined) return override();
-    if (method === "GET" && url === `${WEBSITE}/.well-known/poppy.json`)
-      return json(200, this.poppy);
-    if (method === "GET" && url === METADATA_URL) return json(200, this.metadata);
-    if (method === "POST" && url === TOKEN_ENDPOINT) return this.#token(headers, form);
-    if (method === "POST" && url === DEVICE_ENDPOINT) return this.#device(headers, form);
-    if (method === "POST" && url === REVOCATION_ENDPOINT) return this.#revoke(headers, form);
-    if (url.startsWith(`${API}/`)) return this.#api(method, url, headers);
-    return new Response("not found", { status: 404 });
-  }
-
-  #useJti(payload: Record<string, unknown>): void {
-    const { jti } = payload;
-    if (typeof jti !== "string" || Buffer.from(jti, "base64url").length < 16) {
-      throw new Rejected(oauthError("invalid_grant"));
-    }
-    if (this.#seenJti.has(jti)) throw new Rejected(oauthError("invalid_grant"));
-    this.#seenJti.add(jti);
-  }
-
-  async #agentJwt(jws: string | null | undefined, sub: string): Promise<void> {
-    if (!jws) throw new Rejected(oauthError("invalid_client", 401));
-    const { header, payload } = await verifyJws(jws, this.#publicKey).catch(() => {
-      throw new Rejected(oauthError("invalid_client", 401));
-    });
-    expect(header).toMatchObject({ alg: "ES256", kid: this.signingKey.kid });
-    expect(payload["iss"]).toBe(CLIENT_ID);
-    expect(payload["sub"]).toBe(sub);
-    expect(payload["aud"]).toBe(ISSUER);
-    const now = Math.floor(Date.now() / 1000);
-    expect(payload["exp"]).toBeGreaterThan(now);
-    expect(payload["exp"]).toBeLessThanOrEqual(now + 300);
-    this.#useJti(payload);
-  }
-
-  async #clientAuth(form: URLSearchParams | undefined): Promise<URLSearchParams> {
-    if (form === undefined) throw new Error("expected a form body");
-    expect(form.get("client_id")).toBe(CLIENT_ID);
-    expect(form.get("client_assertion_type")).toBe(
-      "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
-    );
-    await this.#agentJwt(form.get("client_assertion"), CLIENT_ID);
-    return form;
-  }
-
-  #freshNonce(): string {
-    this.#nonceCounter += 1;
-    return `nonce-${this.#nonceCounter}`;
-  }
-
-  async #dpop(
-    headers: Headers,
-    method: string,
-    url: string,
-    accessToken: string | undefined,
-  ): Promise<{ jkt: string; nonce: unknown }> {
-    const proof = headers.get("dpop");
-    if (proof === null) throw new Rejected(oauthError("invalid_dpop_proof"));
-    const [h] = proof.split(".");
-    const jwk = b64urlJson(h ?? "")["jwk"] as JsonWebKey;
-    expect(jwk).not.toHaveProperty("d");
-    const key = await crypto.subtle.importKey("jwk", jwk, ES256, false, ["verify"]);
-    const { header, payload } = await verifyJws(proof, key);
-    expect(header).toMatchObject({ typ: "dpop+jwt", alg: "ES256" });
-    const target = new URL(url);
-    expect(payload["htm"]).toBe(method);
-    expect(payload["htu"]).toBe(`${target.origin}${target.pathname}`);
-    if (accessToken === undefined) expect(payload).not.toHaveProperty("ath");
-    else expect(payload["ath"]).toBe(await sha256(accessToken));
-    this.#useJti(payload);
-    return { jkt: await thumbprint(jwk), nonce: payload["nonce"] };
-  }
-
-  #issue(jkt: string, signedIn: boolean, sessionId: string, extra: Record<string, unknown> = {}) {
-    this.#tokenCounter += 1;
-    const accessToken = `at-${this.#tokenCounter}`;
-    this.#accessTokens.set(accessToken, { jkt, signedIn });
-    return json(
-      200,
-      {
-        access_token: accessToken,
-        token_type: "DPoP",
-        expires_in: this.expiresIn,
-        session_id: sessionId,
-        signed_in: signedIn,
-        scope: "",
-        ...extra,
+  poppyJson(): Record<string, unknown> {
+    return {
+      protocol_version: "0.3",
+      organization: { name: "Example Company", domain: DOMAIN },
+      auth: {
+        scopes: { "orders:read": "See your orders", "orders:write": "Change your orders" },
+        scope_hints: {
+          "orders:read": { changes: "none", personal_data: true },
+          "orders:write": { changes: "something-new", personal_data: false },
+        },
       },
-      { "cache-control": "no-store", "dpop-nonce": this.#tokenNonce || this.#freshNonce() },
-    );
+      agent: { protocols: [{ type: "poppy", endpoint: CONVERSATIONS, access: "signed_in" }] },
+      apis: [
+        { type: "openapi", url: `${API}/openapi.json`, description: "Orders" },
+        { type: "mcp", url: MCP, description: "Search" },
+        { type: "graphql", url: `${API}/graphql` },
+      ],
+      extensions: {
+        operations: { version: "2" },
+        "mediated-sign-in": {
+          version: "1",
+          fields: [
+            { name: "email", label: "Email", secret: false },
+            { name: "password", label: "Password", secret: true },
+          ],
+          scopes: ["orders:read"],
+        },
+      },
+    };
   }
 
-  #newRefresh(sessionId: string): string {
-    const token = `rt-secret-${this.#tokenCounter}-${sessionId}`;
-    this.#refreshTokens.set(token, sessionId);
-    this.issuedSecrets.push(token);
-    return token;
+  metadata(): Record<string, unknown> {
+    return {
+      issuer: ISSUER,
+      token_endpoint: `${ISSUER}/token`,
+      revocation_endpoint: `${ISSUER}/revoke`,
+      authorization_endpoint: `${ISSUER}/authorize`,
+      device_authorization_endpoint: `${ISSUER}/device`,
+      grant_types_supported: [
+        "refresh_token",
+        "authorization_code",
+        "urn:ietf:params:oauth:grant-type:device_code",
+        "https://personalagentprotocol.org/grant/mediated-sign-in",
+      ],
+      scopes_supported: ["orders:read", "orders:write"],
+      protected_resources: [`https://${DOMAIN}`, MCP],
+      ...(this.options.tokenType === "DPoP"
+        ? { dpop_signing_alg_values_supported: ["ES256"] }
+        : {}),
+    };
   }
 
-  async #token(headers: Headers, form: URLSearchParams | undefined): Promise<Response> {
-    const { jkt, nonce } = await this.#dpop(headers, "POST", TOKEN_ENDPOINT, undefined);
-    if (
-      this.tokenNonce === "always" ||
-      (this.tokenNonce === "once" && nonce !== this.#tokenNonce)
-    ) {
-      this.#tokenNonce = this.#freshNonce();
-      return oauthError("use_dpop_nonce", 400, { "dpop-nonce": this.#tokenNonce });
-    }
-    const params = await this.#clientAuth(form);
-    const sessionParam = params.get("session_id");
-    if (sessionParam !== null && this.endedSessions.has(sessionParam)) {
-      return oauthError("invalid_session");
-    }
-    const sessionId = sessionParam ?? `ses-${++this.#sessionCounter}`;
-    switch (params.get("grant_type")) {
-      case "urn:ietf:params:oauth:grant-type:jwt-bearer":
-        await this.#agentJwt(params.get("assertion"), USER_ID);
-        return this.#issue(jkt, false, sessionId);
-      case "refresh_token": {
-        const token = params.get("refresh_token") ?? "";
-        if (!this.#refreshTokens.has(token) || this.revokedRefresh.has(token)) {
-          return oauthError("invalid_grant");
-        }
-        if (!this.rotateRefresh) {
-          return this.#issue(jkt, true, sessionId, { scope: this.grantedScope ?? "poppy:read" });
-        }
-        this.#refreshTokens.delete(token);
-        return this.#issue(jkt, true, sessionId, {
-          scope: this.grantedScope ?? "poppy:read",
-          refresh_token: this.#newRefresh(sessionId),
+  readonly fetch = (async (input: string | URL | Request, init: RequestInit = {}) => {
+    const url = new URL(input instanceof Request ? input.url : String(input));
+    const method = (init.method ?? "GET").toUpperCase();
+    const headers = new Headers(init.headers);
+    const body = init.body === undefined || init.body === null ? "" : String(init.body);
+    this.requests.push({ method, url: url.href, headers, body });
+    return this.#route(url, method, headers, body);
+  }) as typeof fetch;
+
+  async #route(url: URL, method: string, headers: Headers, body: string): Promise<Response> {
+    const here = `${url.origin}${url.pathname}`;
+    switch (here) {
+      case `https://${DOMAIN}/.well-known/poppy.json`:
+        return json(200, this.options.poppy?.(this.poppyJson()) ?? this.poppyJson());
+      case `https://${DOMAIN}/.well-known/oauth-protected-resource`:
+        return json(200, { resource: `https://${DOMAIN}`, authorization_servers: [ISSUER] });
+      case `${ISSUER}/.well-known/oauth-authorization-server`:
+        return json(200, this.metadata());
+      case "https://mcp.example.com/.well-known/oauth-protected-resource/mcp":
+        return json(200, {
+          resource: MCP,
+          authorization_servers: [ISSUER],
+          ...(this.options.tokenType === "DPoP"
+            ? { dpop_signing_alg_values_supported: ["ES256"] }
+            : {}),
+        });
+      case `${API}/openapi.json`:
+        return json(200, { openapi: "3.1.0", servers: [{ url: `${API}/v1` }], paths: {} });
+      case `${ISSUER}/token`:
+        return this.#token(new URLSearchParams(body), headers);
+      case `${ISSUER}/revoke`:
+        return this.#revoke(new URLSearchParams(body));
+      case `${ISSUER}/device`:
+        if (!(await this.#clientOk(new URLSearchParams(body))))
+          return json(401, { error: "invalid_client" });
+        this.deviceScope = (new URLSearchParams(body).get("scope") ?? "").split(" ");
+        return json(200, {
+          device_code: "dc_secret",
+          user_code: "WDJB-MJHT",
+          verification_uri: `${ISSUER}/activate`,
+          verification_uri_complete: `${ISSUER}/activate?user_code=WDJB-MJHT`,
+          expires_in: 600,
+          interval: 0.01,
+        });
+      case `${API}/v1/orders`:
+        return this.#resource(url, method, headers, "orders:read", undefined);
+      case MCP:
+        return this.#resource(url, method, headers, "orders:read", MCP);
+      case `${API}/v1/exchanges`: {
+        const denied = await this.#resource(url, method, headers, "orders:write", undefined);
+        if (denied.status !== 200) return denied;
+        if (headers.get("poppy-approval") === 'operation_id="exc_1", revision="r1"')
+          return json(201, { exchanged: true });
+        return json(403, {
+          error: "approval_required",
+          operation: {
+            operation_id: "exc_1",
+            revision: "r1",
+            summary: "Exchange the jacket for **$70** more. [Details](https://evil.test)",
+            terms: { price_difference: 70 },
+            expires_at: "2099-01-01T00:00:00Z",
+          },
         });
       }
-      case "urn:ietf:params:oauth:grant-type:device_code":
-        return this.#deviceGrant(params, jkt, sessionId);
       default:
-        return oauthError("unsupported_grant_type");
+        return json(404, { error: "not_found" });
     }
   }
 
-  #deviceGrant(params: URLSearchParams, jkt: string, sessionId: string): Response {
-    expect(params.get("device_code")).toBe("dc-secret-1");
-    expect(params.get("session_id")).not.toBeNull();
-    const step = this.devicePolls[Math.min(this.#devicePoll, this.devicePolls.length - 1)];
-    this.#devicePoll += 1;
-    if (step !== "approve") return oauthError(step ?? "authorization_pending");
-    return this.#issue(jkt, true, sessionId, {
-      scope: this.grantedScope ?? "poppy:read poppy:write",
-      refresh_token: this.#newRefresh(sessionId),
-    });
+  async #clientOk(form: URLSearchParams): Promise<boolean> {
+    const assertion = form.get("client_assertion");
+    if (form.get("client_id") !== CLIENT_ID || assertion === null) return false;
+    if (
+      form.get("client_assertion_type") !== "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
+    )
+      return false;
+    if (!(await verify(assertion, this.agentJwk))) return false;
+    const { payload } = decodeJwt(assertion);
+    return (
+      payload["iss"] === CLIENT_ID &&
+      payload["sub"] === CLIENT_ID &&
+      payload["aud"] === ISSUER &&
+      typeof payload["jti"] === "string" &&
+      typeof payload["iat"] === "number"
+    );
   }
 
-  async #device(headers: Headers, form: URLSearchParams | undefined): Promise<Response> {
-    expect(headers.has("dpop")).toBe(false);
-    const params = await this.#clientAuth(form);
-    expect(params.has("session_id")).toBe(false);
-    return json(200, {
-      device_code: "dc-secret-1",
-      user_code: "WDJB-MJHT",
-      verification_uri: "https://example.com/device",
-      verification_uri_complete: "https://example.com/device?user_code=WDJB-MJHT",
-      expires_in: 600,
-      interval: 5,
-    });
+  async #dpopJkt(
+    headers: Headers,
+    method: string,
+    url: string,
+    tokenEndpoint = false,
+  ): Promise<string | undefined | Response> {
+    if (this.options.tokenType !== "DPoP") return undefined;
+    const proof = headers.get("dpop");
+    if (proof === null) return json(400, { error: "invalid_dpop_proof" });
+    const { header, payload } = decodeJwt(proof);
+    const jwk = header["jwk"] as JsonWebKey;
+    if (header["typ"] !== "dpop+jwt" || !(await verify(proof, jwk)))
+      return json(400, { error: "invalid_dpop_proof" });
+    const target = new URL(url);
+    if (payload["htm"] !== method || payload["htu"] !== `${target.origin}${target.pathname}`)
+      return json(400, { error: "invalid_dpop_proof" });
+    if (tokenEndpoint && this.options.dpopNonce && !this.#nonceIssued) {
+      this.#nonceIssued = true;
+      return json(400, { error: "use_dpop_nonce" }, { "dpop-nonce": "n1" });
+    }
+    if (tokenEndpoint && this.options.dpopNonce && payload["nonce"] !== "n1")
+      return json(400, { error: "use_dpop_nonce" });
+    return thumbprint(jwk);
   }
 
-  async #revoke(headers: Headers, form: URLSearchParams | undefined): Promise<Response> {
-    expect(headers.has("dpop")).toBe(false);
-    const params = await this.#clientAuth(form);
-    this.revokedRefresh.add(params.get("token") ?? "");
+  #issue(scope: string[], resource: string | undefined, jkt: string | undefined, refresh: boolean) {
+    const n = ++this.#counter;
+    const access: Issued = { value: `at_${n}`, scope, resource, revoked: false, jkt };
+    this.accessTokens.set(access.value, access);
+    let refreshToken: string | undefined;
+    if (refresh) {
+      refreshToken = `rt_${n}`;
+      this.refreshTokens.set(refreshToken, {
+        value: refreshToken,
+        scope,
+        resource: undefined,
+        revoked: false,
+        jkt,
+      });
+    }
+    return {
+      access_token: access.value,
+      token_type: this.options.tokenType ?? "Bearer",
+      expires_in: 3600,
+      ...(refreshToken === undefined ? {} : { refresh_token: refreshToken }),
+      scope: scope.join(" "),
+    };
+  }
+
+  async #token(form: URLSearchParams, headers: Headers): Promise<Response> {
+    if (!(await this.#clientOk(form))) return json(401, { error: "invalid_client" });
+    const jkt = await this.#dpopJkt(headers, "POST", `${ISSUER}/token`, true);
+    if (jkt instanceof Response) return jkt;
+    const grant = form.get("grant_type");
+    const resource = form.get("resource") ?? undefined;
+    if (grant === "authorization_code") {
+      const code = this.codes.get(form.get("code") ?? "");
+      if (code === undefined) return json(400, { error: "invalid_grant" });
+      this.codes.delete(form.get("code") ?? "");
+      if ((await sha256(form.get("code_verifier") ?? "")) !== code.challenge)
+        return json(400, { error: "invalid_grant" });
+      if (form.get("redirect_uri") !== code.redirectUri)
+        return json(400, { error: "invalid_grant" });
+      return json(200, this.#issue(this.options.grantOnly ?? code.scope, undefined, jkt, true));
+    }
+    if (grant === "urn:ietf:params:oauth:grant-type:device_code") {
+      if (form.get("device_code") !== "dc_secret") return json(400, { error: "invalid_grant" });
+      if (this.device === "pending") return json(400, { error: "authorization_pending" });
+      if (this.device === "slow_down") {
+        this.device = "approved";
+        return json(400, { error: "slow_down" });
+      }
+      if (this.device === "denied") return json(400, { error: "access_denied" });
+      return json(200, this.#issue(this.deviceScope, undefined, jkt, true));
+    }
+    if (grant === "refresh_token") {
+      const token = this.refreshTokens.get(form.get("refresh_token") ?? "");
+      if (token === undefined || token.revoked) return json(400, { error: "invalid_grant" });
+      const scope = form.get("scope")?.split(" ") ?? token.scope;
+      if (scope.some((s) => !token.scope.includes(s))) return json(400, { error: "invalid_scope" });
+      if (resource !== undefined && resource !== MCP) return json(400, { error: "invalid_target" });
+      const issued = this.#issue(scope, resource, jkt, this.options.rotate === true);
+      if (this.options.rotate) token.revoked = true;
+      // RFC 6749 section 5.1: scope left out when it is exactly what was asked for.
+      const { scope: _, ...rest } = issued;
+      return json(200, form.has("scope") ? issued : rest);
+    }
+    if (grant === "https://personalagentprotocol.org/grant/mediated-sign-in") {
+      if (form.has("sign_in_id")) {
+        if (form.get("sign_in_id") !== "sgn_1") return json(400, { error: "invalid_grant" });
+        if (form.has("email") || form.has("password") || form.has("scope"))
+          return json(400, { error: "invalid_request" });
+        if (form.get("one_time_code") !== "123456")
+          return json(400, { error: "code_required", sign_in_id: "sgn_1", expires_in: 600 });
+        return json(200, this.#issue(["orders:read"], undefined, jkt, true));
+      }
+      if (form.get("email") !== "dana@example.net" || form.get("password") !== "hunter2")
+        return json(400, { error: "invalid_grant" });
+      if (this.options.mediatedCode)
+        return json(400, {
+          error: "code_required",
+          sign_in_id: "sgn_1",
+          sent_to: "Text to the phone number ending in 71",
+          expires_in: 600,
+        });
+      return json(200, this.#issue((form.get("scope") ?? "").split(" "), undefined, jkt, true));
+    }
+    return json(400, { error: "unsupported_grant_type" });
+  }
+
+  async #revoke(form: URLSearchParams): Promise<Response> {
+    if (!(await this.#clientOk(form))) return json(401, { error: "invalid_client" });
+    if (form.get("token_type_hint") !== "refresh_token")
+      return json(400, { error: "invalid_request" });
+    const token = form.get("token") ?? "";
+    this.revoked.push(token);
+    const refresh = this.refreshTokens.get(token);
+    if (refresh !== undefined) refresh.revoked = true;
     return new Response(null, { status: 200 });
   }
 
-  async #api(method: string, url: string, headers: Headers): Promise<Response> {
-    const authorization = headers.get("authorization") ?? "";
-    const token = authorization.startsWith("DPoP ") ? authorization.slice(5) : "";
-    const bound = this.#accessTokens.get(token);
-    const challenge = (error: string, extra: Record<string, string> = {}) =>
+  /** Approves a Direct Sign-In at the authorization endpoint and returns the redirect back. */
+  async approve(
+    authorizeUrl: string,
+    options: { iss?: string; deny?: boolean } = {},
+  ): Promise<string> {
+    const url = new URL(authorizeUrl);
+    const redirect = new URL(url.searchParams.get("redirect_uri") ?? "");
+    redirect.searchParams.set("state", url.searchParams.get("state") ?? "");
+    redirect.searchParams.set("iss", options.iss ?? ISSUER);
+    if (options.deny) {
+      redirect.searchParams.set("error", "access_denied");
+      return redirect.href;
+    }
+    const code = `code_${++this.#counter}`;
+    this.codes.set(code, {
+      challenge: url.searchParams.get("code_challenge") ?? "",
+      scope: (url.searchParams.get("scope") ?? "").split(" "),
+      redirectUri: url.searchParams.get("redirect_uri") ?? "",
+    });
+    redirect.searchParams.set("code", code);
+    return redirect.href;
+  }
+
+  /** Verifies the Session header, and the access token if any, as spec 5.3 describes. */
+  async #resource(
+    url: URL,
+    method: string,
+    headers: Headers,
+    scope: string,
+    resource: string | undefined,
+  ): Promise<Response> {
+    const jwt = headers.get("poppy-session");
+    if (jwt === null) return json(400, { error: "invalid_session" });
+    const { header, payload } = decodeJwt(jwt);
+    const delegation = header["poppy_dlg"];
+    if (typeof delegation !== "string" || !(await verify(delegation, this.agentJwk)))
+      return json(400, { error: "invalid_session", error_description: "delegation" });
+    const dlg = decodeJwt(delegation);
+    const cnf = (dlg.payload["cnf"] as { jwk: JsonWebKey }).jwk;
+    if (
+      dlg.header["typ"] !== "poppy-delegation+jwt" ||
+      dlg.payload["iss"] !== CLIENT_ID ||
+      Number(dlg.payload["exp"]) - Number(dlg.payload["iat"]) > 86400 ||
+      "d" in cnf
+    )
+      return json(400, { error: "invalid_session", error_description: "delegation claims" });
+    this.delegationJtis.add(String(dlg.payload["jti"]));
+    if (!(await verify(jwt, cnf)) || header["kid"] !== (await thumbprint(cnf)))
+      return json(400, { error: "invalid_session", error_description: "signature" });
+    if (
+      header["typ"] !== "poppy-session+jwt" ||
+      payload["iss"] !== CLIENT_ID ||
+      payload["aud"] !== ISSUER ||
+      payload["htm"] !== method ||
+      payload["htu"] !== `${url.origin}${url.pathname}`
+    )
+      return json(400, { error: "invalid_session", error_description: "claims" });
+    this.sessionClaims.push(payload);
+
+    const authorization = headers.get("authorization");
+    const challenge =
+      resource === undefined
+        ? ""
+        : `, resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource/mcp"`;
+    if (authorization === null) {
+      if (payload["ath"] !== undefined) return json(400, { error: "invalid_session" });
+      return new Response(null, {
+        status: 401,
+        headers: { "www-authenticate": `Bearer scope="${scope}"${challenge}` },
+      });
+    }
+    const [scheme, value = ""] = authorization.split(" ");
+    const token = this.accessTokens.get(value);
+    if (payload["ath"] !== (await sha256(value))) return json(400, { error: "invalid_session" });
+    const invalid = () =>
       new Response(null, {
         status: 401,
-        headers: { "www-authenticate": `DPoP error="${error}"`, ...extra },
+        headers: { "www-authenticate": `${scheme} error="invalid_token"${challenge}` },
       });
-    if (bound === undefined || this.invalidAccess.has(token)) return challenge("invalid_token");
-    const { jkt, nonce } = await this.#dpop(headers, method, url, token);
-    if (jkt !== bound.jkt) return challenge("invalid_dpop_proof");
-    if (this.apiNonce === "always" || (this.apiNonce === "once" && nonce !== this.#apiNonce)) {
-      this.#apiNonce = this.#freshNonce();
-      return challenge("use_dpop_nonce", { "dpop-nonce": this.#apiNonce });
+    if (this.rejectNextToken) {
+      this.rejectNextToken = false;
+      return invalid();
     }
-    return json(200, { ok: true, signedIn: bound.signedIn, path: new URL(url).pathname });
+    if (token === undefined || token.revoked || token.resource !== resource) return invalid();
+    if ((this.options.tokenType === "DPoP") !== (scheme === "DPoP")) return invalid();
+    if (scheme === "DPoP") {
+      const jkt = await this.#dpopJkt(headers, method, url.href);
+      if (jkt instanceof Response || jkt !== token.jkt) return invalid();
+      const proof = decodeJwt(headers.get("dpop") ?? "");
+      if (proof.payload["ath"] !== (await sha256(value))) return invalid();
+    }
+    if (!token.scope.includes(scope))
+      return new Response(null, {
+        status: 403,
+        headers: { "www-authenticate": `Bearer error="insufficient_scope", scope="${scope}"` },
+      });
+    return json(200, { ok: true, scope: token.scope });
   }
 }

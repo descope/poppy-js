@@ -14,7 +14,11 @@
     "isolatedModules": true,
     "rewriteRelativeImportExtensions": true,
     "skipLibCheck": true,
-    "noEmit": true
+    "noEmit": true,
+    "paths": {
+      "@descope/poppy": ["./src/index.ts"],
+      "@descope/poppy/conformance": ["./src/conformance/index.ts"]
+    }
   },
-  "include": ["src", "test", "examples"]
+  "include": ["src", "test", "examples", "packages/*/src", "packages/*/test"]
 }

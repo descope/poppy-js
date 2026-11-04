@@ -1,0 +1,43 @@
+{
+  "name": "@descope/poppy-conformance",
+  "version": "0.0.0",
+  "description": "Conformance tests for Personal Agent Protocol (Poppy) Personal Agents, in any language.",
+  "keywords": [
+    "conformance",
+    "personal-agent-protocol",
+    "poppy",
+    "testing"
+  ],
+  "homepage": "https://github.com/descope/poppy-js/tree/main/packages/conformance#readme",
+  "license": "Apache-2.0",
+  "author": "Descope",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/descope/poppy-js.git",
+    "directory": "packages/conformance"
+  },
+  "bin": {
+    "poppy-conformance": "./dist/cli.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/harness.d.ts",
+      "default": "./dist/harness.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json"
+  },
+  "dependencies": {
+    "@descope/poppy": "workspace:*",
+    "@peculiar/x509": "3.1.0",
+    "reflect-metadata": "0.2.2"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

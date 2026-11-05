@@ -1,148 +1,172 @@
-# @descope/poppy
+# Personal Agent Protocol TypeScript SDK
 
-TypeScript client for the [Personal Agent Protocol (Poppy)](https://personalagentprotocol.org/docs/spec.md), for people building Personal Agents.
+<!-- prettier-ignore -->
+> [!IMPORTANT]
+> **This SDK implements [draft 0.3](https://personalagentprotocol.org/docs/spec.md) of the Personal Agent Protocol.** It follows the draft as of spec commit [`7205250`](https://github.com/personal-agent-protocol/personal-agent-protocol/commit/7205250) (2026-11-02). The spec can still change in ways that aren't backward compatible before 1.0, and so can this SDK. Each release names the draft it follows.
 
-Point it at a Company's website and it discovers the Company, opens a Session for your User, signs the User in with Device Sign-In, and calls the Company's APIs with DPoP-bound Session Tokens.
+<!-- prettier-ignore -->
+> [!NOTE]
+> **This is a community SDK, not owned by any vendor.** It works with any Company and any authorization server that follows the spec. For a feature or a larger change, please [open an issue](https://github.com/descope/poppy-js/issues/new) first; see [CONTRIBUTING.md](CONTRIBUTING.md).
 
-- Zero runtime dependencies: `fetch` and WebCrypto only.
-- ESM, Node.js 22 or later.
-- Follows the spec, not any one Company's implementation.
+![Apache-2.0 licensed](https://img.shields.io/badge/license-Apache--2.0-blue) ![Spec draft 0.3](https://img.shields.io/badge/spec-draft%200.3-purple) ![Node.js 22+](https://img.shields.io/badge/node-%E2%89%A522-green)
 
-> Status: 0.1, pre-release. The API may change before 1.0.
+<details>
+<summary>Table of Contents</summary>
 
-## Install
+- [Overview](#overview)
+- [How it works](#how-it-works)
+- [Installation](#installation)
+- [Getting Started](#getting-started)
+- [What's included](#whats-included)
+- [Documentation](#documentation)
+- [Contributing](#contributing)
+- [License](#license)
 
-```sh
+</details>
+
+## Overview
+
+The Personal Agent Protocol (Poppy for short) lets a Personal Agent, acting for one User, work with a Company on that User's behalf. The Company publishes `/.well-known/poppy.json`, and the Personal Agent uses it to find the Company's APIs, website and Company Agent, identify itself and the User on every request, and get the User's approval for account access through standard OAuth.
+
+This repository contains the TypeScript SDK for the **Personal Agent** side of the protocol. It handles the protocol for you, so your agent can focus on the User's task:
+
+- **Discovery** of a Company, with every check the spec requires before anything is sent to it
+- **Sessions**: a pairwise User ID per Company, and a fresh, signed Session JWT on every request
+- **Sign-in** with Direct, Device or Mediated Sign-In, and automatic token refresh, rotation and DPoP
+- **Interactions**: APIs and MCP servers, the Company's website through browser join, and conversations with the Company Agent
+- **Task coverage**, including the Company's skills, and the **Operations**, **Links** and **Disclosures** extensions
+- **UCP**: through Poppy's UCP extension, discover a Company's Universal Commerce Protocol profile, negotiate, and check out with signed requests in the User's Poppy Session
+- **A conformance suite** that checks a Personal Agent in any language against the spec, which this SDK passes in full
+- **Tools for models**: hand a Company to the Vercel AI SDK, Anthropic, OpenAI or any MCP client as tools, with secrets kept out of the model
+
+It has zero runtime dependencies, uses `fetch` and WebCrypto only, and runs on Node.js 22 or later.
+
+## How it works
+
+Your agent talks to the SDK. The SDK talks to the Company, and keeps every secret (keys, tokens, Session JWTs, codes) out of your model's context.
+
+```mermaid
+flowchart TB
+    subgraph Agent["Your Personal Agent"]
+        direction LR
+        Model["Model and task logic"] -->|"session.fetch(), conversations()"| SDK["Poppy SDK"]
+        SDK <--> Store[("Store: User IDs,<br/>refresh tokens")]
+    end
+
+    subgraph Company["A Company"]
+        direction LR
+        Poppy["/.well-known/poppy.json"]
+        Issuer["OAuth issuer"]
+        APIs["APIs, MCP servers,<br/>Company Agent"]
+        Web["Website"]
+    end
+
+    SDK -->|"1 discover"| Poppy
+    SDK -->|"2 sign in"| Issuer
+    SDK -->|"3 Session JWT<br/>+ access token"| APIs
+    SDK -->|"browser join"| Web
+```
+
+Signed out, a request carries only the Session header, which says which Personal Agent, User and Session it belongs to. Once the User signs in, the same request also carries an OAuth access token for their account. [How it works](docs/how-it-works.md) walks through each flow with sequence diagrams.
+
+## Installation
+
+```bash
+npm install @descope/poppy
+# or
 pnpm add @descope/poppy
+# or
+yarn add @descope/poppy
 ```
 
-## Quickstart
+The package isn't published to npm yet. Until it is, install it from this repository.
 
-Your agent needs an identity first (spec 4.1): an ES256 key pair, and two documents served over HTTPS from your agent's domain. The SDK builds both:
+## Getting Started
 
-```ts
-import { clientMetadata, jwks } from "@descope/poppy";
+Here is what a Personal Agent looks like. It finds a Company, asks its Company Agent a question while signed out, and calls an API, signing the User in when the API asks for their account:
 
-const { publicKey, privateKey } = await crypto.subtle.generateKey(
-  { name: "ECDSA", namedCurve: "P-256" },
-  true,
-  ["sign", "verify"],
-);
-
-// Serve at https://agent.example.net/client.json
-const metadata = clientMetadata({
-  clientId: "https://agent.example.net/client.json",
-  clientName: "Example Agent",
-  jwksUri: "https://agent.example.net/jwks.json",
-});
-
-// Serve at https://agent.example.net/jwks.json
-const keySet = await jwks([{ publicKey, kid: "agent-key-1" }]);
-```
-
-Keep the private key in your secret store. Then, per User and Company:
-
-```ts
-import { PoppyAgent } from "@descope/poppy";
+```typescript
+import { PoppyAgent, scopesNeeded } from "@descope/poppy";
 
 const agent = new PoppyAgent({
-  clientId: "https://agent.example.net/client.json",
+  clientId: "https://agent.example.net/agent.json",
   signingKey: { privateKey, kid: "agent-key-1" },
+  redirectUri: "https://agent.example.net/oauth/callback",
 });
 
 const company = await agent.discover("example.com");
-const session = await agent.session(company, userId);
+const user = await agent.user(company, "your-own-user-id");
+const session = user.session();
 
-if (!session.signedIn) {
-  const signIn = await session.startDeviceSignIn("poppy:read");
-  console.log(`Open ${signIn.verificationUri} and enter ${signIn.userCode}`);
-  const { scope } = await signIn.wait();
-}
+// Talk to the Company Agent, signed out.
+const { conversation } = await session.conversations().start({
+  text: "Do you have the Stormline jacket in medium?",
+  context: { locale: "en-US", user_available: true },
+});
+const { events } = await conversation.readAll({ wait: 10 });
 
-const response = await session.fetch("https://api.example.com/orders");
-
-await session.signOut();
-```
-
-A full runnable version is in [examples/device-sign-in.ts](examples/device-sign-in.ts).
-
-## What it does
-
-| Spec               | SDK                                                                                                                                                                                                                                                                                                                                   |
-| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 3, 3.2 Discovery   | `agent.discover(website)` fetches `/.well-known/poppy.json` and the issuer's RFC 8414 metadata, and refuses a Company that fails a required check: unsupported major version, `organization.domain` not the host that served it, issuer mismatch, `poppy_domains` not listing the domain, no ES256 DPoP, a non-HTTPS URL or redirect. |
-| 4.1 Agent identity | `clientMetadata()` and `jwks()` build the documents you publish. Client assertions use `private_key_jwt` with `aud` set to the issuer.                                                                                                                                                                                                |
-| 4.2 Sessions       | `agent.session(company, userId)` starts a signed-out Session with a JWT bearer assertion, or resumes a stored one.                                                                                                                                                                                                                    |
-| 4.3 DPoP           | Every token request and API call carries a DPoP Proof. Server nonces are cached per origin and retried once.                                                                                                                                                                                                                          |
-| 4.6 Device Sign-In | `session.startDeviceSignIn(scope)` and `signIn.wait()`, with `slow_down` handling, a deadline and an `AbortSignal`.                                                                                                                                                                                                                   |
-| 4.8 Renewing       | `session.renew()`, and automatically before a Session Token expires. Signed in: the Account Token. Signed out: a fresh assertion. An expired Account Token drops the Session to signed out; an ended Session starts a new one.                                                                                                        |
-| 4.9 Sign-out       | `session.signOut()` revokes the Account Token (RFC 7009).                                                                                                                                                                                                                                                                             |
-| 6 APIs             | `session.fetch(url)` calls an API with the Session Token.                                                                                                                                                                                                                                                                             |
-
-Errors are `PoppyError` with the OAuth `error` code, the HTTP `status`, `errorDescription`, and `retryAfter` on HTTP 429. The spec requires you to wait `retryAfter` seconds before retrying; the SDK does not sleep for you.
-
-## Storage
-
-Each Session keeps its DPoP private key, Session ID and Account Token in a `Store`:
-
-```ts
-interface Store {
-  get(key: string): Promise<string | undefined>;
-  set(key: string, value: string): Promise<void>;
-  delete(key: string): Promise<void>;
+// Call an API. If it needs the User's account, sign them in and try again.
+let response = await session.fetch("https://api.example.com/orders");
+const scope = scopesNeeded(response);
+if (scope !== undefined) {
+  const { url } = await user.startDirectSignIn({ scope });
+  // Open `url` in the User's browser. When it returns to your redirect URI:
+  await agent.completeDirectSignIn(company, callbackUrl);
+  response = await session.fetch("https://api.example.com/orders");
 }
 ```
 
-The default `MemoryStore` loses everything on exit, so every restart starts new Sessions. In production, pass a store backed by encrypted storage. The SDK writes the new state before it uses a token response, so a crash cannot lose an Account Token the Company already rotated.
+Ready to build something real? Follow the step-by-step tutorial:
 
-Use one `PoppyAgent` per store in a process. The agent keeps one live Session per User and Company, but agents or processes that share a store do not coordinate, and can overwrite each other's Account Token. State is stored under the key `poppy:<clientId>:<issuer>:<userId>`. Call `agent.forget(company, userId)` to revoke a User's Account Token at a Company and delete their state there. If revocation fails, it rejects and keeps the state so you can call it again.
+- [Build your first Personal Agent](docs/get-started/first-agent.md): from an agent identity to a signed-in API call and a conversation
 
-## User IDs
+Using an LLM framework? Hand the Company to your model as tools:
 
-`userId` is the ID your agent gives this User at this Company (spec 4.2). It must be:
+```typescript
+import { generateText, jsonSchema, tool } from "ai";
+import { poppyTools, toAiSdkTools } from "@descope/poppy";
 
-- stable, so the Company sees the same User across Sessions;
-- different for each Company, so Companies cannot match Users with each other;
-- opaque: never containing or derived from personal information such as an email address, phone number or name, even with a keyed hash.
+const tools = toAiSdkTools(poppyTools({ user, requestApproval, signIn }), { tool, jsonSchema });
+```
 
-A random ID per User per Company, stored by your agent, meets all three. The SDK does not generate or derive it.
+See [Tools for models](docs/tools.md) for the Anthropic, OpenAI and MCP versions.
 
-## Security notes
+For a runnable script, see [`examples/quickstart.ts`](examples/quickstart.ts).
 
-- **Your signing key stays yours.** You pass the agent's private signing key in; the SDK never exports or stores it.
-- **DPoP keys are extractable.** The SDK generates one DPoP key pair per User per Company and keeps the private key in your `Store` as a JWK, so a Session survives a restart. Protect the store accordingly.
-- **Tokens go only where they belong.** `session.fetch` requires `https` and a host that is the Company's domain, one of its subdomains, or a host listed in its `poppy.json` APIs or Company Agent. Redirects are returned to you, never followed with the token.
-- **No private addresses.** Discovery refuses a Company URL or redirect whose host is loopback, private or link-local (`localhost`, `10.x`, `192.168.x`, `169.254.x`, `::1` and similar). Pass `allowPrivateAddresses: true` to allow them, for tests. A DNS name that resolves to such an address is not caught.
-- **Sign-in links are checked.** Device Sign-In refuses a `verification_uri` whose host is not the issuer's or a `poppy_domains` entry, or a subdomain of either.
-- **Secrets stay out of errors and logs.** Session Tokens, Account Tokens, device codes and assertions are held in private fields. Errors carry only the status, error code and description.
-- **A replaced Account Token is not revoked.** When Device Sign-In replaces an existing Account Token, the spec suggests revoking the old one (4.4). The SDK does not do this yet; call `signOut()` first if you need it.
+## What's included
 
-Report vulnerabilities as described in [SECURITY.md](SECURITY.md).
+| Spec section     | What the SDK does                                                                                                                                                                                                                              |
+| ---------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 3 Discovery      | `agent.discover()` reads `poppy.json`, finds the issuer from the domain's protected resource metadata, and checks the link between the domain and the issuer in both directions. It also reads the logo, `auth.disabled` and the skill index.  |
+| 4 OAuth          | `user.startDirectSignIn()`, `user.startDeviceSignIn()`, `user.mediatedSignIn()` and `user.signOut()`. Refresh, rotation, DPoP and per-service tokens happen inside `session.fetch()`.                                                          |
+| 5 Sessions       | `agent.user()` keeps a random User ID per User per Company. `user.session()` starts a Session. Every request to a listed API or endpoint gets a Session JWT signed with a short-lived delegated key, and `session_ended` starts a new Session. |
+| 6 Web browsing   | `session.joinBrowser()` joins your agent's own browser to the Session.                                                                                                                                                                         |
+| 7 APIs           | `session.fetch()` for OpenAPI APIs, and as the `fetch` of any MCP client.                                                                                                                                                                      |
+| 8 Conversations  | `session.conversations()` to start, send, read, stream, hand off, close and open Direct Conversations, including ones the Company asks for and speaks first in.                                                                                |
+| 9 Task coverage  | `session.excludedTasks()`, `session.sendFeedback()`, and `session.fetchSkill()` for the Company's skills.                                                                                                                                      |
+| Extensions       | Operations (`operationFromResponse()`, `approvalFor()`, `renderSummary()`), Links and Disclosures in messages, Mediated Sign-In, and UCP.                                                                                                      |
+| Tools for models | `poppyTools()`, with `toAiSdkTools()`, `toAnthropicTools()`, `toOpenAITools()` and `toMcpTools()`.                                                                                                                                             |
+| UCP              | `discoverCompanyUcp()`, `negotiateUcp()` and `UcpClient` for checkout, carts, catalog and orders, with signed requests in the User's Session.                                                                                                  |
+| Conformance      | `@descope/poppy/conformance` checks any Personal Agent against the spec's rules for agents.                                                                                                                                                    |
 
-## Runtime
+## Documentation
 
-Node.js 22 or later. Discovery follows redirects by hand so it can check that every hop stays on HTTPS, which needs real `3xx` responses from `fetch(url, { redirect: "manual" })`. Browsers return an opaque response instead, so browsers are not supported.
-
-## Not yet supported
-
-These parts of the spec are not in this release:
-
-- Direct Sign-In and Mediated Sign-In (4.5, 4.7)
-- Bearer Session Tokens for MCP servers (4.3). `session.fetch` sends DPoP to every host.
-- Session Tokens issued for a specific `resource` (4.3). `session.fetch` never requests one, so APIs or Company Agents that require one will refuse its token.
-- Web browsing (5)
-- Conversations with Company Agents (7)
-- Extensions (3.3)
-- Request timeouts. Pass a `fetch` that adds one, such as `(url, init) => fetch(url, { ...init, signal: AbortSignal.timeout(10_000) })`.
+- [Build your first Personal Agent](docs/get-started/first-agent.md): a step-by-step tutorial
+- [Tools for models](docs/tools.md): give a model a Company's APIs and Company Agent as tools, with the AI SDK, Anthropic, OpenAI or MCP
+- [UCP](docs/ucp.md): commerce with the Universal Commerce Protocol, next to Poppy
+- [Conformance](packages/conformance/README.md): test any Personal Agent, in any language, against the spec's rules, with a CLI, baselines and a GitHub Action
+- [How it works](docs/how-it-works.md): discovery, Sessions, sign-in, requests, browser join, conversations and operations, with sequence diagrams
+- [Security and storage](docs/security.md): what the SDK protects, what it stores, and what you must protect
+- [Troubleshooting](docs/troubleshooting.md): common errors and their fixes
+- [Interoperability](docs/interop.md): how the SDK is tested against the spec project's conformance fake
+- [Personal Agent Protocol specification](https://personalagentprotocol.org/docs/spec.md)
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). This project follows a [Code of Conduct](CODE_OF_CONDUCT.md).
+Issues and pull requests are welcome on GitHub at <https://github.com/descope/poppy-js>. See [CONTRIBUTING.md](CONTRIBUTING.md) for setup and guidelines, and [MAINTAINERS.md](MAINTAINERS.md) for who maintains the project. Questions about the protocol itself belong in the [specification's repository](https://github.com/personal-agent-protocol/personal-agent-protocol/issues).
 
-## Contact Us
-
-If you need help you can email [Descope Support](mailto:support@descope.com)
+This project follows a [Code of Conduct](CODE_OF_CONDUCT.md). Report vulnerabilities as [SECURITY.md](SECURITY.md) describes.
 
 ## License
 
-[Apache-2.0](LICENSE)
+This project is licensed under the Apache License 2.0. See the [LICENSE](LICENSE) file for details.

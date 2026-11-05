@@ -13,6 +13,8 @@ export function httpsUrl(value: unknown, what: string): URL {
     throw new PoppyProtocolError(`${what} is not a URL`);
   }
   if (url.protocol !== "https:") throw new PoppyProtocolError(`${what} must use https`);
+  if (url.username !== "" || url.password !== "")
+    throw new PoppyProtocolError(`${what} must not contain credentials`);
   return url;
 }
 
@@ -65,21 +67,79 @@ export function checkPublicHost(url: URL, what: string, allowPrivate: boolean): 
   }
 }
 
-/** Follows up to five redirects, each of which must stay on https and off private addresses (spec 3). */
+export interface JsonResult {
+  status: number;
+  body: unknown;
+  /** The URL that answered, after redirects. */
+  url: URL;
+}
+
+/**
+ * GETs a public JSON document with no credentials. Follows up to five redirects, each of which must stay
+ * on https and off private addresses (spec 3). Returns 404 as `{ status: 404 }` when `allowNotFound`, and
+ * throws on any other error status.
+ */
 export async function getJson(
   fetchFn: Fetch,
   url: URL,
   what: string,
-  allowPrivate = false,
-): Promise<{ body: unknown; url: URL }> {
+  options: { allowPrivate?: boolean; allowNotFound?: boolean; followRedirects?: boolean } = {},
+): Promise<JsonResult> {
   let current = url;
   for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
-    checkPublicHost(current, what, allowPrivate);
+    checkPublicHost(current, what, options.allowPrivate ?? false);
     const response = await fetchFn(current, {
       redirect: "manual",
       headers: { accept: "application/json" },
     });
     if (response.status >= 300 && response.status < 400) {
+      const location = response.headers.get("location");
+      await response.body?.cancel();
+      if (options.followRedirects === false)
+        throw new PoppyProtocolError(`${what} must not redirect`);
+      if (location === null) throw new PoppyProtocolError(`${what} redirect has no Location`);
+      current = httpsUrl(new URL(location, current).href, `${what} redirect`);
+      continue;
+    }
+    if (response.status === 404 && options.allowNotFound) {
+      await response.body?.cancel();
+      return { status: 404, body: undefined, url: current };
+    }
+    if (!response.ok) {
+      await response.body?.cancel();
+      throw new PoppyProtocolError(`${what} returned HTTP ${response.status}`);
+    }
+    try {
+      return { status: response.status, body: await response.json(), url: current };
+    } catch {
+      throw new PoppyProtocolError(`${what} is not JSON`);
+    }
+  }
+  throw new PoppyProtocolError(`${what} redirected more than ${MAX_REDIRECTS} times`);
+}
+
+/** Like {@link getJson}, but returns the body as text, for documents that may be YAML. */
+export async function getText(
+  fetchFn: Fetch,
+  url: URL,
+  what: string,
+  allowPrivate: boolean,
+): Promise<string> {
+  return new TextDecoder().decode(await getBytes(fetchFn, url, what, allowPrivate));
+}
+
+/** Like {@link getJson}, but returns the body's raw bytes, such as a skill artifact to hash. */
+export async function getBytes(
+  fetchFn: Fetch,
+  url: URL,
+  what: string,
+  allowPrivate: boolean,
+): Promise<Uint8Array> {
+  let current = url;
+  for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
+    checkPublicHost(current, what, allowPrivate);
+    const response = await fetchFn(current, { redirect: "manual" });
+    if (isRedirect(response)) {
       const location = response.headers.get("location");
       await response.body?.cancel();
       if (location === null) throw new PoppyProtocolError(`${what} redirect has no Location`);
@@ -90,22 +150,18 @@ export async function getJson(
       await response.body?.cancel();
       throw new PoppyProtocolError(`${what} returned HTTP ${response.status}`);
     }
-    try {
-      return { body: await response.json(), url: current };
-    } catch {
-      throw new PoppyProtocolError(`${what} is not JSON`);
-    }
+    return new Uint8Array(await response.arrayBuffer());
   }
   throw new PoppyProtocolError(`${what} redirected more than ${MAX_REDIRECTS} times`);
 }
 
-/** Never follows redirects, so credentials in the body stay at their endpoint. */
+/** Never follows redirects, so credentials in the body stay at their endpoint (spec 3). */
 export function postForm(
   fetchFn: Fetch,
   url: string,
   body: URLSearchParams,
   headers: Record<string, string> = {},
-) {
+): Promise<Response> {
   return fetchFn(url, {
     method: "POST",
     redirect: "manual",
@@ -120,4 +176,45 @@ export function postForm(
 
 export function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+export function isRedirect(response: Response): boolean {
+  return response.status >= 300 && response.status < 400;
+}
+
+/** `https://{host}` for a domain, lowercased with no trailing slash (spec 3.2). */
+export function originOf(domain: string): string {
+  return `https://${domain.toLowerCase()}`;
+}
+
+/**
+ * The RFC 9728 section 3.1 metadata URL for a resource: the well-known suffix goes between the host and
+ * the path, and a lone `/` path is dropped.
+ */
+export function resourceMetadataUrl(resource: string): URL {
+  const url = new URL(resource);
+  const path = url.pathname === "/" ? "" : url.pathname.replace(/\/$/, "");
+  return new URL(`${url.origin}/.well-known/oauth-protected-resource${path}`);
+}
+
+/** RFC 8414 section 3.1: the same rule for an issuer. */
+export function authorizationServerMetadataUrl(issuer: string): URL {
+  const url = new URL(issuer);
+  const path = url.pathname === "/" ? "" : url.pathname.replace(/\/$/, "");
+  return new URL(`${url.origin}/.well-known/oauth-authorization-server${path}`);
+}
+
+export function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    signal?.throwIfAborted();
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    function onAbort() {
+      clearTimeout(timer);
+      reject(signal?.reason);
+    }
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
 }

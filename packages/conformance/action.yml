@@ -1,0 +1,36 @@
+name: Personal Agent Protocol conformance
+description: Runs the Personal Agent Protocol conformance suite against your Personal Agent.
+branding:
+  icon: check-circle
+  color: purple
+inputs:
+  command:
+    description: The command that runs your everything-agent. The website URL is appended to it.
+    required: true
+  suite:
+    description: all, core, oauth or interactions.
+    default: all
+  expected-failures:
+    description: Path to a YAML baseline of known failures.
+    default: ""
+  client-id:
+    description: Your agent's published client_id. Leave empty to use a test identity.
+    default: ""
+  version:
+    description: The version of @descope/poppy-conformance to run.
+    default: latest
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        COMMAND: ${{ inputs.command }}
+        SUITE: ${{ inputs.suite }}
+        BASELINE: ${{ inputs.expected-failures }}
+        CLIENT_ID: ${{ inputs.client-id }}
+        VERSION: ${{ inputs.version }}
+      run: |
+        args=(agent --command "$COMMAND" --suite "$SUITE")
+        if [ -n "$BASELINE" ]; then args+=(--expected-failures "$BASELINE"); fi
+        if [ -n "$CLIENT_ID" ]; then args+=(--client-id "$CLIENT_ID"); fi
+        npx --yes "@descope/poppy-conformance@$VERSION" "${args[@]}"

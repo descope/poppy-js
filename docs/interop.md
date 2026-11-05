@@ -1,67 +1,42 @@
 # Interoperability
 
-The test suite runs against a mocked Company (`test/mock-company.ts`). This page records which
-parts of the SDK can also be checked against a real, third-party OAuth server, and which parts
-stay mock-only.
+The SDK is tested two ways.
 
-Status: proposal. No live interop run exists yet. Everything below about Keycloak comes from its
-documentation and source, not from a run against this SDK.
+## The spec project's conformance fake
 
-## Candidate server: Keycloak 26.8.1
+`test/interop/` runs the SDK against `fake-company.ts` from the
+[spec repository](https://github.com/personal-agent-protocol/personal-agent-protocol), vendored in
+`test/interop/kit/`. It is the in-memory Company the spec's own validator tests itself with, so it
+checks the SDK against the spec authors' reading of draft 0.3:
 
-Image `quay.io/keycloak/keycloak:26.8.1` (released 2026-10-13).
+- discovery, including the www redirect, redirects to uploads or to `http`, a mismatched domain,
+  several issuers, a trailing slash on `resource`, and a Company with no issuer;
+- delegations and Session JWTs, with ES256 and PS384 keys and a custom `Signer`;
+- client assertions at the token endpoint;
+- `invalid_session`, which the SDK returns without retrying;
+- conversations: start, read, message ID retries and conflicts, operations in messages, handoff,
+  close, SSE streaming, and continuing in another Session;
+- browser join, end to end with a fake browser;
+- excluded tasks, feedback, and alternatives that name unlisted APIs.
 
-| SDK behavior                                         | Standard                          | Keycloak 26.8.1                                                                                                                        | Source                                                                                                                         |
-| ---------------------------------------------------- | --------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
-| Authorization server metadata                        | RFC 8414                          | The SDK builds the RFC 8414 section 3 form, `/.well-known/oauth-authorization-server/realms/{realm}`, which Keycloak serves since 26.4 | [26.4 changes](https://github.com/keycloak/keycloak/blob/main/docs/documentation/upgrading/topics/changes/changes-26_4_0.adoc) |
-| DPoP-bound tokens and API calls                      | RFC 9449                          | Supported, feature `dpop` on by default                                                                                                | [DPoP guide](https://www.keycloak.org/securing-apps/dpop)                                                                      |
-| DPoP server nonce retry (`use_dpop_nonce`)           | RFC 9449 section 8                | Not implemented on the token endpoint, so the retry path is not exercised                                                              | [keycloak#39042](https://github.com/keycloak/keycloak/issues/39042)                                                            |
-| Device sign-in, `authorization_pending`, `slow_down` | RFC 8628                          | Supported, feature `device-flow` on by default; enable per client                                                                      | [Specifications](https://www.keycloak.org/securing-apps/specifications)                                                        |
-| `private_key_jwt` client auth, ES256                 | RFC 7523 section 2.2              | "Signed JWT" client authenticator; ES256 with keys from a JWKS URL not confirmed                                                       | [Server admin guide](https://www.keycloak.org/docs/latest/server_admin/index.html)                                             |
-| URL as `client_id`                                   | Client ID Metadata Document draft | Experimental, feature `cimd` off by default, needs a client policy                                                                     | [MCP authorization server](https://www.keycloak.org/securing-apps/mcp-authz-server)                                            |
-| Signed-out Session start (jwt-bearer grant)          | RFC 7523 section 2.1              | Supported since 26.6, feature `jwt-authorization-grant` on by default                                                                  | [JWT authorization grant](https://www.keycloak.org/securing-apps/jwt-authorization-grant)                                      |
-| Sign-out                                             | RFC 7009                          | `/realms/{realm}/protocol/openid-connect/revoke`                                                                                       | [OIDC layers](https://www.keycloak.org/securing-apps/oidc-layers)                                                              |
-| Account Token rotation                               | RFC 6749 section 6                | Realm setting "Revoke Refresh Token"                                                                                                   | [Server admin guide](https://www.keycloak.org/docs/latest/server_admin/index.html)                                             |
+The fake refuses every grant, so signed-in flows run against `test/mock-company.ts` instead: Direct,
+Device and Mediated Sign-In, refresh and rotation, revocation, `resource` tokens for MCP servers,
+DPoP with server nonces, and the Operations extension.
 
-Keycloak's jwt-bearer grant has constraints a run must satisfy:
+## A real OAuth server
 
-- the client must be confidential and have "JWT Authorization Grant" switched on;
-- an identity provider of type "JWT Authorization Grant" must trust the assertion issuer (the
-  agent's `clientId`) and its JWKS URL;
-- the assertion `sub` (the SDK's `userId`) must be a Keycloak user already linked to that
-  identity provider;
-- the assertion needs a single `aud` and a `jti`, and lives at most 5 minutes. The SDK sends
-  `aud` = issuer, a fresh `jti`, and a 60-second lifetime.
+No live run exists yet. Sign-in, refresh and revocation are plain OAuth, so an existing server can
+cover them. A server needs:
 
-## Poppy-only, mock-only
+- RFC 8414 metadata with `protected_resources` listing the Company's domain, and RFC 9728 metadata
+  on the domain naming the issuer;
+- Client ID Metadata Documents, with `private_key_jwt` and ES256 keys from the client's `jwks_uri`;
+- client assertions addressed to the issuer, not the token endpoint (draft-ietf-oauth-rfc7523bis);
+- RFC 9207 `iss` on authorization responses, and RFC 8628 for Device Sign-In.
 
-No third-party server has these, so they stay covered by the mock until a live Descope run is
-added under the same gate:
+Keycloak 26.8 supports most of these, with Client ID Metadata Documents behind the experimental
+`cimd` feature. Whether it accepts the issuer as a client assertion's `aud` is unconfirmed.
 
-- `/.well-known/poppy.json` discovery and the `poppy_domains` check in the OAuth metadata;
-- the `session_id` and `signed_in` token response fields;
-- the `invalid_session` and `account_mismatch` error codes.
-
-## What a live run needs
-
-1. HTTPS. The SDK rejects `http:` issuers, endpoints and API URLs, and `start-dev` serves plain
-   HTTP, so Keycloak must sit behind a TLS proxy with a certificate the test process trusts. The proxy
-   must also expose `/.well-known/` at the root, where the metadata lives.
-2. A hand-built `Company` passed to `agent.session(company, userId)`, since `discover` requires
-   `poppy.json`. Device sign-in also needs `deviceScopes` set on it.
-3. The agent's client metadata and JWKS served over HTTPS at the `clientId` URL, for `cimd` and
-   the jwt-bearer identity provider to fetch.
-4. Gate the test on `POPPY_INTEROP_ISSUER` and keep it out of the default `pnpm test` run: CI
-   enforces coverage floors, and a skipped file must not count against them.
-
-Start Keycloak (admin password from the environment):
-
-```bash
-docker run --rm -p 8080:8080 -e KC_BOOTSTRAP_ADMIN_USERNAME=admin -e KC_BOOTSTRAP_ADMIN_PASSWORD="$KC_ADMIN_PASSWORD" quay.io/keycloak/keycloak:26.8.1 start-dev --features=cimd
-```
-
-Open questions:
-
-- Does Keycloak accept the issuer URL as `aud` for both the client assertion and the jwt-bearer
-  assertion, or only the token endpoint URL?
-- Does the "Signed JWT" authenticator accept ES256 keys from a CIMD client's `jwks_uri`?
+Session JWTs, browser join, conversations and task coverage are Poppy's own, so only a Poppy
+Company can check them. A live test against one should be gated on an environment variable and kept
+out of the default `pnpm test` run, since CI enforces coverage floors.

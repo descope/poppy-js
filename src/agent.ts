@@ -1,713 +1,550 @@
-import { type Company, discover, isAllowedHost } from "./discovery.ts";
-import { DpopKey } from "./dpop.ts";
-import { errorFromResponse, PoppyError, PoppyProtocolError } from "./errors.ts";
-import { type Fetch, httpsUrl, isObject, postForm } from "./http.ts";
-import { nowSeconds, randomId, signJwt } from "./jose.ts";
+import {
+  Account,
+  type DeviceSignIn,
+  type MediatedSignInResult,
+  PENDING_LIFETIME,
+  PENDING_PREFIX,
+  type PendingDirectSignIn,
+} from "./account.ts";
+import { type Company, discover } from "./discovery.ts";
+import { PoppyProtocolError } from "./errors.ts";
+import { type Fetch, httpsUrl } from "./http.ts";
+import { randomId, type Signer, type SigningKey, signerFromKey } from "./jose.ts";
+import { isLoopbackRedirect } from "./metadata.ts";
+import { requireOAuth } from "./oauth.ts";
+import type { OperatorSignatureOptions } from "./operator.ts";
+import { ResourceResolver } from "./resources.ts";
+import { Session } from "./session.ts";
+import { DelegatedKeys } from "./session-jwt.ts";
 import { MemoryStore, type Store } from "./store.ts";
-
-const JWT_BEARER = "urn:ietf:params:oauth:grant-type:jwt-bearer";
-const DEVICE_CODE = "urn:ietf:params:oauth:grant-type:device_code";
-const CLIENT_ASSERTION_TYPE = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
-const ASSERTION_LIFETIME = 60;
-const EXPIRY_MARGIN = 30;
-const SESSION_ENDED = new Set(["invalid_session", "account_mismatch"]);
-/** Sessions erased by {@link PoppyAgent.forget} must not write state back or use a token. */
-const forgotten = new WeakSet<Session>();
-// Signs out and marks the Session forgotten in one queued step, so nothing queued after it can write.
-let closeSession: (session: Session) => Promise<void>;
-
-/** Signs the agent's client and Session assertions. Publish the public half at `jwks_uri`. */
-export interface SigningKey {
-  privateKey: CryptoKey;
-  /** Must match this key's `kid` in the published key set. */
-  kid: string;
-}
 
 export interface PoppyAgentOptions {
   /** HTTPS URL of the client metadata document, exactly as published (spec 4.1). */
   clientId: string;
-  signingKey: SigningKey;
-  /** Defaults to {@link MemoryStore}. */
+  /** A key from your `jwks_uri`. Give this or `signer`. */
+  signingKey?: SigningKey;
+  /** Signs with a key from your `jwks_uri` your own way, such as in a KMS or blindly (spec 10.7). */
+  signer?: Signer;
+  /** Holds User IDs and refresh tokens. Defaults to {@link MemoryStore}. Use encrypted storage in production. */
   store?: Store;
   /** Defaults to the global `fetch`. Every request is sent with `redirect: "manual"`. */
   fetch?: Fetch;
   /** Allow loopback, private and link-local Company hosts, as in tests. Off by default (spec 3). */
   allowPrivateAddresses?: boolean;
+  /** The default `redirect_uri` for Direct Sign-In, one of your `redirect_uris` (spec 4.2). */
+  redirectUri?: string;
+  /**
+   * Extensions you list in your client metadata (spec 3.3), such as `{ operations: { version: "2" } }`.
+   * Keep it the same as the document, so the Company and this client agree on what you support.
+   */
+  extensions?: Readonly<Record<string, { version: string }>>;
+  /** Seconds each delegation lasts, at most 24 hours (spec 5.2). Defaults to one hour. */
+  delegationLifetime?: number;
+  /** Also sign requests with Web Bot Auth, so bot defenses recognize you (spec 5.3). Recommended. */
+  operatorSignature?: OperatorSignatureOptions;
 }
 
-interface PersistedState {
-  dpopKey: JsonWebKey;
-  sessionId?: string | undefined;
-  accountToken?: string;
-  scope?: string;
+export interface UserOptions {
+  /**
+   * Names one of the User's agents, such as `travel` or `shopping`, so the Company can tell them apart
+   * (spec 5.1). The Company sees only an opaque Agent ID. Leave out if you have one agent.
+   */
+  agent?: string;
+  /**
+   * Names one of the User's accounts at this Company, such as `personal` or `business`, each with its own
+   * refresh token and Sessions (spec 5.4). Defaults to `default`.
+   */
+  account?: string;
 }
 
-interface TokenResponse {
-  accessToken: string;
-  expiresIn: number;
-  scope: string | undefined;
-  sessionId: string | undefined;
-  signedIn: boolean | undefined;
-  refreshToken: string | undefined;
+interface StoredIds {
+  userId: string;
+  agentIds: Record<string, string>;
 }
 
-function parseTokenResponse(body: unknown): TokenResponse {
-  if (!isObject(body)) throw new PoppyProtocolError("token response must be an object");
-  const { access_token, token_type, expires_in, scope, session_id, signed_in, refresh_token } =
-    body;
-  if (typeof access_token !== "string" || access_token === "")
-    throw new PoppyProtocolError("access_token is missing");
-  if (typeof token_type !== "string" || token_type.toLowerCase() !== "dpop") {
-    throw new PoppyProtocolError("token_type must be DPoP");
-  }
-  if (typeof expires_in !== "number" || !(expires_in > 0))
-    throw new PoppyProtocolError("expires_in must be positive");
-  return {
-    accessToken: access_token,
-    expiresIn: expires_in,
-    scope: typeof scope === "string" ? scope : undefined,
-    sessionId: typeof session_id === "string" ? session_id : undefined,
-    signedIn: typeof signed_in === "boolean" ? signed_in : undefined,
-    refreshToken: typeof refresh_token === "string" ? refresh_token : undefined,
-  };
-}
+const STORE_PREFIX = "poppy:0.3";
 
-interface ClientContext {
-  clientId: string;
-  company: Company;
-  signingKey: SigningKey;
-  fetch: Fetch;
-}
-
-function signAssertion(
-  { clientId, company, signingKey }: ClientContext,
-  sub: string,
-): Promise<string> {
-  const iat = nowSeconds();
-  return signJwt(
-    { typ: "JWT", kid: signingKey.kid },
-    {
-      iss: clientId,
-      sub,
-      aud: company.issuer,
-      iat,
-      exp: iat + ASSERTION_LIFETIME,
-      jti: randomId(),
-    },
-    signingKey.privateKey,
-  );
-}
-
-async function clientAuth(context: ClientContext): Promise<Record<string, string>> {
-  return {
-    client_id: context.clientId,
-    client_assertion_type: CLIENT_ASSERTION_TYPE,
-    client_assertion: await signAssertion(context, context.clientId),
-  };
-}
-
-/** Revokes an Account Token (spec 4.9). Needs no DPoP proof, so it works without a Session. */
-async function revokeAccountToken(context: ClientContext, token: string): Promise<void> {
-  const body = new URLSearchParams({
-    token,
-    token_type_hint: "refresh_token",
-    ...(await clientAuth(context)),
-  });
-  const response = await postForm(context.fetch, context.company.revocationEndpoint, body);
-  if (!response.ok) throw await errorFromResponse(response);
-  await response.body?.cancel();
-}
-
-/** Reads the `error` attribute of `WWW-Authenticate`, such as `sign_in_required` (spec section 6). */
-export function wwwAuthenticateError(response: Response): string | undefined {
-  return /\berror="([^"]*)"/.exec(response.headers.get("www-authenticate") ?? "")?.[1];
-}
-
-function sleep(ms: number, signal: AbortSignal | undefined): Promise<void> {
-  return new Promise((resolve, reject) => {
-    signal?.throwIfAborted();
-    const timer = setTimeout(() => {
-      signal?.removeEventListener("abort", onAbort);
-      resolve();
-    }, ms);
-    function onAbort() {
-      clearTimeout(timer);
-      reject(signal?.reason);
-    }
-    signal?.addEventListener("abort", onAbort, { once: true });
-  });
-}
-
-/** A Personal Agent. Opens Sessions with Companies for its Users. */
+/** A Personal Agent. Gives each of its Users a pairwise User ID at each Company, and opens their Sessions. */
 export class PoppyAgent {
   readonly clientId: string;
-  readonly #signingKey: SigningKey;
+  readonly extensions: Readonly<Record<string, { version: string }>>;
+  readonly #signer: Signer;
   readonly #store: Store;
   readonly #fetch: Fetch;
-  readonly #allowPrivateAddresses: boolean;
-  readonly #sessions = new Map<string, Promise<Session>>();
+  readonly #allowPrivate: boolean;
+  readonly #redirectUri: string | undefined;
+  readonly #delegationLifetime: number;
+  readonly #operator: OperatorSignatureOptions | undefined;
+  readonly #users = new Map<string, Promise<PoppyUser>>();
   /**
-   * Opening a User waits for its in-flight {@link forget} and fails if it failed, so it never reuses state
-   * that was not deleted.
+   * One Account per stored account, shared by every PoppyUser for it (each agent name and domain), so
+   * refresh token rotation and sign-out run through one queue (spec 4.4, 5.1).
    */
-  readonly #forgetting = new Map<string, Promise<void>>();
+  readonly #accounts = new Map<string, Promise<Account>>();
+  readonly #ids = new Map<string, Promise<StoredIds>>();
+  #pendingIndex: Promise<unknown> = Promise.resolve();
+  readonly #keys = new Map<string, DelegatedKeys>();
+  readonly #resolvers = new Map<string, ResourceResolver>();
 
   constructor(options: PoppyAgentOptions) {
-    if (httpsUrl(options.clientId, "clientId").href !== options.clientId) {
+    if (httpsUrl(options.clientId, "clientId").href !== options.clientId)
       throw new PoppyProtocolError("clientId must be a normalized URL, exactly as published");
-    }
+    const signer =
+      options.signer ??
+      (options.signingKey === undefined ? undefined : signerFromKey(options.signingKey));
+    if (signer === undefined) throw new TypeError("give signingKey or signer");
+    if (options.redirectUri !== undefined) checkRedirectUri(options.redirectUri);
     this.clientId = options.clientId;
-    this.#signingKey = options.signingKey;
+    this.extensions = options.extensions ?? {};
+    this.#signer = signer;
     this.#store = options.store ?? new MemoryStore();
     this.#fetch = options.fetch ?? fetch;
-    this.#allowPrivateAddresses = options.allowPrivateAddresses ?? false;
+    this.#allowPrivate = options.allowPrivateAddresses ?? false;
+    this.#redirectUri = options.redirectUri;
+    this.#delegationLifetime = options.delegationLifetime ?? 3600;
+    this.#operator = options.operatorSignature;
   }
 
   /** Like {@link discover}, using this agent's `fetch` and `allowPrivateAddresses`. */
   discover(website: string): Promise<Company> {
-    return discover(website, {
-      fetch: this.#fetch,
-      allowPrivateAddresses: this.#allowPrivateAddresses,
-    });
+    return discover(website, { fetch: this.#fetch, allowPrivateAddresses: this.#allowPrivate });
+  }
+
+  /** Whether this agent lists an extension at a version (spec 3.3). */
+  supports(name: string, version: string): boolean {
+    return this.extensions[name]?.version === version;
   }
 
   /**
-   * Opens the Session for `userId` at `company`, resuming a stored one.
-   *
-   * `userId` is an opaque ID (spec 4.2): stable, different per Company, and never an email or derived from
-   * personal data, even with a keyed hash.
+   * Returns one of your Users at a Company, with a stable User ID made for that Company alone (spec 5.1).
+   * `localUserId` is your own ID for the User. The Company never sees it: it gets a random ID this agent
+   * stores, so the ID is opaque, differs at each Company, and isn't derived from personal data.
    */
-  session(company: Company, userId: string): Promise<Session> {
-    if (userId === "") return Promise.reject(new PoppyProtocolError("userId is required"));
-    const storeKey = this.#storeKey(company, userId);
-    // One Session per stored state, so two never overwrite each other's Account Token.
-    let session = this.#sessions.get(storeKey);
-    if (session === undefined) {
-      const forgetting = this.#forgetting.get(storeKey);
-      session =
-        forgetting === undefined
-          ? this.#openSession(company, userId, storeKey)
-          : forgetting.then(() => this.#openSession(company, userId, storeKey));
-      session.catch(() => {
-        if (this.#sessions.get(storeKey) === session) this.#sessions.delete(storeKey);
+  user(company: Company, localUserId: string, options: UserOptions = {}): Promise<PoppyUser> {
+    if (localUserId === "")
+      return Promise.reject(new PoppyProtocolError("localUserId is required"));
+    const account = options.account ?? "default";
+    // Keyed by domain too: domains that share an issuer keep their own poppy.json (spec 3.2).
+    const key = JSON.stringify([
+      company.identifier,
+      localUserId,
+      account,
+      options.agent ?? null,
+      company.domain,
+    ]);
+    let user = this.#users.get(key);
+    if (user === undefined) {
+      user = this.#openUser(company, localUserId, account, options.agent);
+      user.catch(() => {
+        if (this.#users.get(key) === user) this.#users.delete(key);
       });
-      this.#sessions.set(storeKey, session);
+      this.#users.set(key, user);
     }
-    return session;
+    return user;
   }
 
   /**
-   * Revokes the stored Account Token if there is one, then deletes the stored state for `userId` at `company`.
-   * Sessions opened earlier stop working; the next {@link session} call starts a new, signed-out one.
-   * If revocation fails, rejects and keeps the stored state, so the token is not lost while still valid;
-   * call again to retry.
+   * A User with a new User ID for one anonymous browsing session, like a private browser window (spec
+   * 5.1). Nothing is stored, and it can't sign in. Discard it when the browsing session ends.
    */
-  forget(company: Company, userId: string): Promise<void> {
-    const storeKey = this.#storeKey(company, userId);
-    const open = this.#sessions.get(storeKey);
-    this.#sessions.delete(storeKey);
-    const previous = this.#forgetting.get(storeKey)?.catch(() => undefined) ?? Promise.resolve();
-    const forgetting = previous.then(() => this.#erase(company, storeKey, open));
-    this.#forgetting.set(storeKey, forgetting);
-    void forgetting
-      .catch(() => undefined)
-      .then(() => {
-        if (this.#forgetting.get(storeKey) === forgetting) this.#forgetting.delete(storeKey);
-      });
-    return forgetting;
-  }
-
-  async #erase(
-    company: Company,
-    storeKey: string,
-    open: Promise<Session> | undefined,
-  ): Promise<void> {
-    const session = await open?.catch(() => undefined);
-    if (session !== undefined) {
-      // Queued behind the Session's own token requests, so it revokes the latest rotated Account Token.
-      await closeSession(session);
-    } else {
-      const token = await this.#storedAccountToken(storeKey);
-      if (token !== undefined) {
-        await revokeAccountToken(
-          {
-            clientId: this.clientId,
-            company,
-            signingKey: this.#signingKey,
-            fetch: this.#fetch,
-          },
-          token,
-        );
-      }
-    }
-    await this.#store.delete(storeKey);
-  }
-
-  #storeKey(company: Company, userId: string): string {
-    return `poppy:${this.clientId}:${company.issuer}:${userId}`;
-  }
-
-  async #storedAccountToken(storeKey: string): Promise<string | undefined> {
-    const stored = await this.#store.get(storeKey);
-    if (stored === undefined) return undefined;
-    try {
-      return (JSON.parse(stored) as PersistedState).accountToken;
-    } catch {
-      return undefined;
-    }
-  }
-
-  async #openSession(company: Company, userId: string, storeKey: string): Promise<Session> {
-    const stored = await this.#store.get(storeKey);
-    let state: PersistedState;
-    let dpopKey: DpopKey;
-    if (stored === undefined) {
-      const generated = await DpopKey.generate();
-      dpopKey = generated.key;
-      state = { dpopKey: generated.exported };
-      await this.#store.set(storeKey, JSON.stringify(state));
-    } else {
-      try {
-        state = JSON.parse(stored) as PersistedState;
-      } catch {
-        // V8's SyntaxError quotes the input, which holds the Account Token and DPoP private key.
-        throw new PoppyProtocolError("stored state is not valid JSON");
-      }
-      dpopKey = await DpopKey.fromJwk(state.dpopKey);
-    }
-    const session = new Session({
+  anonymousUser(company: Company): PoppyUser {
+    return new PoppyUser(this, {
       company,
-      userId,
-      clientId: this.clientId,
-      signingKey: this.#signingKey,
-      fetch: this.#fetch,
-      dpopKey,
-      state,
-      persist: (next) => this.#store.set(storeKey, JSON.stringify(next)),
+      localUserId: undefined,
+      userId: randomId("anon_"),
+      agentId: undefined,
+      accountName: undefined,
+      agentName: undefined,
+      account: undefined,
     });
-    await session.renew();
-    return session;
-  }
-}
-
-interface SessionInit {
-  company: Company;
-  userId: string;
-  clientId: string;
-  signingKey: SigningKey;
-  fetch: Fetch;
-  dpopKey: DpopKey;
-  state: PersistedState;
-  persist: (state: PersistedState) => Promise<void>;
-}
-
-type FetchBody = Exclude<RequestInit["body"], ReadableStream | null | undefined>;
-
-/** Get one from {@link PoppyAgent.session} (spec 4.2). */
-export class Session {
-  readonly company: Company;
-  readonly #init: SessionInit;
-  #state: PersistedState;
-  #accessToken: string | undefined;
-  #expiresAt = 0;
-  #signedIn = false;
-  #renewing: Promise<void> | undefined;
-  #signOuts = 0;
-  #queue: Promise<unknown> = Promise.resolve();
-  readonly #nonces = new Map<string, string>();
-
-  constructor(init: SessionInit) {
-    this.company = init.company;
-    this.#init = init;
-    this.#state = init.state;
-  }
-
-  /** Not a credential. Undefined if the Company returned none. */
-  get sessionId(): string | undefined {
-    return this.#state.sessionId;
-  }
-
-  get signedIn(): boolean {
-    return this.#signedIn;
-  }
-
-  /** Space-separated account scopes of the current Session Token. Empty when signed out. */
-  get scope(): string {
-    return this.#state.scope ?? "";
   }
 
   /**
-   * Gets a new Session Token now, using the Account Token if there is one (spec 4.8), else a fresh Session
-   * assertion (4.2). Concurrent calls share one request.
+   * Finishes a Direct Sign-In from the URL the User's browser was sent back to (spec 4.2), in any process
+   * that shares this agent's store. Resolves with the User and the granted scopes.
    */
-  renew(): Promise<void> {
-    this.#renewing ??= this.#serial(() => this.#renew()).finally(() => {
-      this.#renewing = undefined;
+  async completeDirectSignIn(
+    company: Company,
+    callbackUrl: string | URL,
+  ): Promise<{ user: PoppyUser; scope: string[] }> {
+    const params = new URL(String(callbackUrl)).searchParams;
+    const state = params.get("state");
+    if (state === null) throw new PoppyProtocolError("the sign-in response has no state");
+    const key = `${PENDING_PREFIX}${state}`;
+    const stored = await this.#store.get(key);
+    if (stored === undefined) throw new PoppyProtocolError("unknown or already used sign-in state");
+    // Single use, whatever the outcome.
+    await this.#store.delete(key);
+    const record = JSON.parse(stored) as PendingDirectSignIn;
+    await this.trackPendingSignIn(state, undefined);
+    if (Date.now() > record.expiresAt) throw new PoppyProtocolError("the sign-in expired");
+    if (record.identifier !== company.identifier)
+      throw new PoppyProtocolError("the sign-in was started at another Company");
+    const user = await this.user(company, record.localUserId, {
+      account: record.account,
+      ...(record.agent === undefined ? {} : { agent: record.agent }),
     });
-    return this.#renewing;
+    return { user, scope: await user.accountFor().completeDirect(record, params) };
   }
 
-  async #renew(): Promise<void> {
-    this.#ensureNotForgotten();
-    if (this.#state.accountToken !== undefined) {
-      try {
-        await this.#renewWith(() => this.#refreshParams(), this.#state.scope ?? "");
-        return;
-      } catch (error) {
-        if (!(error instanceof PoppyError) || error.error !== "invalid_grant") throw error;
-        // Spec 4.8: invalid_grant means the Account Token is gone; continue signed out.
-        await this.#forgetAccount();
-      }
+  /**
+   * Signs the account out and deletes its stored state. With `userIds`, also deletes the User's User ID
+   * and Agent IDs at this Company, so the Company sees a new User next time.
+   */
+  async forget(
+    company: Company,
+    localUserId: string,
+    options: UserOptions & { userIds?: boolean } = {},
+  ): Promise<void> {
+    const { userIds, ...userOptions } = options;
+    const user = await this.user(company, localUserId, userOptions);
+    const account = userOptions.account ?? "default";
+    if (company.oauth !== undefined) {
+      await user.accountFor().forget();
+      await this.dropPendingSignIns(company.identifier, localUserId, account);
     }
-    await this.#renewWith(() => this.#assertionParams(), "");
+    this.#accounts.delete(this.#accountKey(company, localUserId, account));
+    // Every PoppyUser for this account, whatever its agent name or domain, held the forgotten Account.
+    // Deleted User IDs are shared by all accounts, so then every account's PoppyUsers go.
+    for (const key of this.#users.keys()) {
+      const [identifier, local, name] = JSON.parse(key) as unknown[];
+      if (
+        identifier === company.identifier &&
+        local === localUserId &&
+        (name === account || userIds === true)
+      )
+        this.#users.delete(key);
+    }
+    if (userIds === true) {
+      const idsKey = this.#idsKey(company, localUserId);
+      this.#ids.delete(idsKey);
+      await this.#store.delete(idsKey);
+    }
   }
 
-  /** Token, sign-out and Session ID writes must never interleave. */
-  #serial<T>(task: () => Promise<T>): Promise<T> {
-    const run = this.#queue.then(task, task);
-    this.#queue = run.catch(() => undefined);
+  #idsKey(company: Company, localUserId: string): string {
+    return `${STORE_PREFIX}:ids:${JSON.stringify([this.clientId, company.identifier, localUserId])}`;
+  }
+
+  /** User IDs and Agent IDs are scoped by the Company's identifier, not a host (spec 5.1). */
+  async #userIds(
+    company: Company,
+    localUserId: string,
+    agent: string | undefined,
+  ): Promise<StoredIds> {
+    const key = this.#idsKey(company, localUserId);
+    const previous = this.#ids.get(key) ?? Promise.resolve(undefined);
+    const next = previous
+      .catch(() => undefined)
+      .then(async (cached) => {
+        let ids = cached;
+        if (ids === undefined) {
+          const stored = await this.#store.get(key);
+          ids =
+            stored === undefined
+              ? { userId: randomId("usr_"), agentIds: {} }
+              : (JSON.parse(stored) as StoredIds);
+          if (stored === undefined) await this.#store.set(key, JSON.stringify(ids));
+        }
+        if (agent !== undefined && ids.agentIds[agent] === undefined) {
+          ids = { ...ids, agentIds: { ...ids.agentIds, [agent]: randomId("agt_") } };
+          await this.#store.set(key, JSON.stringify(ids));
+        }
+        return ids;
+      });
+    this.#ids.set(key, next);
+    return next;
+  }
+
+  async #openUser(
+    company: Company,
+    localUserId: string,
+    accountName: string,
+    agentName: string | undefined,
+  ): Promise<PoppyUser> {
+    const ids = await this.#userIds(company, localUserId, agentName);
+    const account =
+      company.oauth === undefined
+        ? undefined
+        : await this.#account(company, localUserId, accountName);
+    return new PoppyUser(this, {
+      company,
+      localUserId,
+      userId: ids.userId,
+      agentId: agentName === undefined ? undefined : ids.agentIds[agentName],
+      accountName,
+      agentName,
+      account,
+    });
+  }
+
+  #accountKey(company: Company, localUserId: string, accountName: string): string {
+    return `${STORE_PREFIX}:account:${JSON.stringify([this.clientId, company.identifier, localUserId, accountName])}`;
+  }
+
+  #account(company: Company, localUserId: string, accountName: string): Promise<Account> {
+    const storeKey = this.#accountKey(company, localUserId, accountName);
+    let account = this.#accounts.get(storeKey);
+    if (account === undefined) {
+      const created = new Account({
+        clientId: this.clientId,
+        signer: this.#signer,
+        fetch: this.#fetch,
+        store: this.#store,
+        storeKey,
+        company,
+      });
+      account = created.load().then(() => created);
+      account.catch(() => {
+        if (this.#accounts.get(storeKey) === account) this.#accounts.delete(storeKey);
+      });
+      this.#accounts.set(storeKey, account);
+    }
+    return account;
+  }
+
+  /**
+   * @internal Keeps an index of pending Direct Sign-Ins, and deletes the records of expired ones, so an
+   * abandoned sign-in doesn't leave its PKCE verifier in the store. `expiresAt` undefined removes `state`.
+   */
+  trackPendingSignIn(state: string, expiresAt: number | undefined): Promise<void> {
+    const indexKey = `${PENDING_PREFIX}index`;
+    const run = this.#pendingIndex.then(async () => {
+      const stored = await this.#store.get(indexKey);
+      const index = stored === undefined ? {} : (JSON.parse(stored) as Record<string, number>);
+      const now = Date.now();
+      for (const [pending, expires] of Object.entries(index)) {
+        if (expires >= now && pending !== state) continue;
+        delete index[pending];
+        if (pending !== state) await this.#store.delete(`${PENDING_PREFIX}${pending}`);
+      }
+      if (expiresAt !== undefined) index[state] = expiresAt;
+      await this.#store.set(indexKey, JSON.stringify(index));
+    });
+    this.#pendingIndex = run.catch(() => undefined);
     return run;
   }
 
-  /** Keeps `fallbackScope` when the response omits `scope` (RFC 6749 section 5.1). */
-  async #renewWith(
-    params: () => Promise<Record<string, string>>,
-    fallbackScope: string,
-  ): Promise<void> {
-    try {
-      await this.#applyToken(await this.#tokenRequest(params), fallbackScope);
-    } catch (error) {
-      const ended = error instanceof PoppyError && SESSION_ENDED.has(error.error);
-      if (!ended || this.#state.sessionId === undefined) throw error;
-      await this.#persist({ ...this.#state, sessionId: undefined });
-      await this.#applyToken(await this.#tokenRequest(params), fallbackScope);
-    }
-  }
-
-  async #assertionParams(): Promise<Record<string, string>> {
-    const assertion = await signAssertion(this.#init, this.#init.userId);
-    return { grant_type: JWT_BEARER, assertion, ...this.#sessionParam() };
-  }
-
-  async #refreshParams(): Promise<Record<string, string>> {
-    return {
-      grant_type: "refresh_token",
-      refresh_token: this.#state.accountToken ?? "",
-      ...this.#sessionParam(),
-    };
-  }
-
-  #sessionParam(): Record<string, string> {
-    return this.#state.sessionId === undefined ? {} : { session_id: this.#state.sessionId };
-  }
-
-  #rememberNonce(url: string, response: Response): void {
-    const nonce = response.headers.get("dpop-nonce");
-    if (nonce !== null) this.#nonces.set(new URL(url).origin, nonce);
-  }
-
-  async #tokenRequest(params: () => Promise<Record<string, string>>): Promise<TokenResponse> {
-    const url = this.company.tokenEndpoint;
-    for (let attempt = 0; ; attempt++) {
-      const nonce = this.#nonces.get(new URL(url).origin);
-      const proof = await this.#init.dpopKey.proof(
-        "POST",
-        url,
-        nonce === undefined ? {} : { nonce },
-      );
-      const body = new URLSearchParams({ ...(await params()), ...(await clientAuth(this.#init)) });
-      const response = await postForm(this.#init.fetch, url, body, { dpop: proof });
-      this.#rememberNonce(url, response);
-      if (response.ok) {
-        try {
-          return parseTokenResponse(await response.json());
-        } catch (error) {
-          throw error instanceof PoppyError
-            ? error
-            : new PoppyProtocolError("token response is not JSON");
+  /**
+   * @internal Deletes the pending Direct Sign-Ins an account started, so a callback that arrives after
+   * sign-out or forget can't sign it back in.
+   */
+  dropPendingSignIns(identifier: string, localUserId: string, account: string): Promise<void> {
+    const indexKey = `${PENDING_PREFIX}index`;
+    const run = this.#pendingIndex.then(async () => {
+      const stored = await this.#store.get(indexKey);
+      if (stored === undefined) return;
+      const index = JSON.parse(stored) as Record<string, number>;
+      for (const state of Object.keys(index)) {
+        const key = `${PENDING_PREFIX}${state}`;
+        const value = await this.#store.get(key);
+        if (value !== undefined) {
+          const record = JSON.parse(value) as PendingDirectSignIn;
+          if (
+            record.identifier !== identifier ||
+            record.localUserId !== localUserId ||
+            record.account !== account
+          )
+            continue;
+          await this.#store.delete(key);
         }
+        delete index[state];
       }
-      const error = await errorFromResponse(response);
-      if (error.error !== "use_dpop_nonce" || attempt > 0) throw error;
-    }
-  }
-
-  async #applyToken(token: TokenResponse, fallbackScope: string): Promise<string> {
-    const next: PersistedState = {
-      ...this.#state,
-      sessionId: token.sessionId ?? this.#state.sessionId,
-      scope: token.scope ?? fallbackScope,
-      ...(token.refreshToken === undefined ? {} : { accountToken: token.refreshToken }),
-    };
-    await this.#persist(next);
-    this.#accessToken = token.accessToken;
-    this.#expiresAt = Date.now() + token.expiresIn * 1000;
-    this.#signedIn = token.signedIn ?? next.accountToken !== undefined;
-    return next.scope ?? "";
-  }
-
-  #ensureNotForgotten(): void {
-    if (forgotten.has(this)) throw new PoppyProtocolError("this Session was forgotten");
-  }
-
-  async #persist(state: PersistedState): Promise<void> {
-    this.#ensureNotForgotten();
-    // A rotated Account Token is already the only valid one, even if the write fails.
-    this.#state = state;
-    await this.#init.persist(state);
-  }
-
-  async #forgetAccount(): Promise<void> {
-    const { accountToken: _, ...rest } = this.#state;
-    this.#accessToken = undefined;
-    this.#expiresAt = 0;
-    this.#signedIn = false;
-    await this.#persist({ ...rest, scope: "" });
-  }
-
-  async #currentToken(): Promise<string> {
-    this.#ensureNotForgotten();
-    if (this.#accessToken === undefined || Date.now() >= this.#expiresAt - EXPIRY_MARGIN * 1000)
-      await this.renew();
-    if (this.#accessToken === undefined) throw new PoppyProtocolError("no Session Token");
-    return this.#accessToken;
-  }
-
-  /**
-   * Calls a Company API with the Session Token and a DPoP Proof (spec 4.3, section 6).
-   * The URL must be https on the Company's domain, a subdomain, or an API or Company Agent host from poppy.json.
-   * Redirects are returned, not followed. Retries once on a DPoP nonce challenge and once on `invalid_token`.
-   * Other 401 and 403 responses are returned; see {@link wwwAuthenticateError}.
-   */
-  async fetch(
-    input: string | URL,
-    init: Omit<RequestInit, "body" | "redirect"> & { body?: FetchBody } = {},
-  ): Promise<Response> {
-    const url = httpsUrl(String(input), "API URL");
-    if (!isAllowedHost(this.company, url.hostname)) {
-      throw new PoppyProtocolError(`${url.hostname} is not a host of ${this.company.domain}`);
-    }
-    if (url.username !== "" || url.password !== "")
-      throw new PoppyProtocolError("API URL must not carry credentials");
-    if (init.body instanceof ReadableStream) {
-      throw new PoppyProtocolError(
-        "streaming bodies are not supported, since a retry resends the body",
-      );
-    }
-    const method = (init.method ?? "GET").toUpperCase();
-    let nonceRetried = false;
-    let renewed = false;
-    for (;;) {
-      const token = await this.#currentToken();
-      const nonce = this.#nonces.get(url.origin);
-      const proof = await this.#init.dpopKey.proof(
-        method,
-        url.href,
-        nonce === undefined ? { accessToken: token } : { accessToken: token, nonce },
-      );
-      const headers = new Headers(init.headers);
-      headers.set("authorization", `DPoP ${token}`);
-      headers.set("dpop", proof);
-      const response = await this.#init.fetch(url, {
-        ...init,
-        method,
-        headers,
-        redirect: "manual",
-      });
-      this.#rememberNonce(url.href, response);
-      if (response.status !== 401) return response;
-      const error = wwwAuthenticateError(response);
-      if (error === "use_dpop_nonce" && !nonceRetried) {
-        nonceRetried = true;
-      } else if (error === "invalid_token" && !renewed) {
-        renewed = true;
-        await this.renew();
-      } else {
-        return response;
-      }
-      await response.body?.cancel();
-    }
-  }
-
-  /**
-   * Starts Device Sign-In (spec 4.6). Show the User `verificationUri` and `userCode`, then call
-   * {@link DeviceSignIn.wait}.
-   *
-   * @param scope Space-separated, each from `company.deviceScopes`.
-   */
-  async startDeviceSignIn(scope: string): Promise<DeviceSignIn> {
-    const signOuts = this.#signOuts;
-    const { deviceAuthorizationEndpoint, deviceScopes } = this.company;
-    if (deviceAuthorizationEndpoint === undefined || deviceScopes === undefined) {
-      throw new PoppyProtocolError(`${this.company.domain} does not offer Device Sign-In`);
-    }
-    const requested = scope.split(" ").filter(Boolean);
-    const unavailable = requested.filter((item) => !deviceScopes.includes(item));
-    if (requested.length === 0 || unavailable.length > 0) {
-      throw new PoppyError("invalid_scope", {
-        description: `request scopes from: ${deviceScopes.join(" ")}`,
-      });
-    }
-    const body = new URLSearchParams({
-      scope: requested.join(" "),
-      ...(await clientAuth(this.#init)),
+      await this.#store.set(indexKey, JSON.stringify(index));
     });
-    const response = await postForm(this.#init.fetch, deviceAuthorizationEndpoint, body);
-    if (!response.ok) throw await errorFromResponse(response);
-    const data: unknown = await response.json().catch(() => undefined);
-    if (!isObject(data))
-      throw new PoppyProtocolError("device authorization response must be an object");
-    const {
-      device_code,
-      user_code,
-      verification_uri,
-      verification_uri_complete,
-      expires_in,
-      interval,
-    } = data;
-    if (
-      typeof device_code !== "string" ||
-      typeof user_code !== "string" ||
-      typeof expires_in !== "number"
-    ) {
-      throw new PoppyProtocolError("device authorization response is missing fields");
-    }
-    return new DeviceSignIn(
-      {
-        userCode: user_code,
-        verificationUri: this.#signInUrl(verification_uri, "verification_uri"),
-        verificationUriComplete:
-          verification_uri_complete === undefined
-            ? undefined
-            : this.#signInUrl(verification_uri_complete, "verification_uri_complete"),
-        expiresIn: expires_in,
-        interval: typeof interval === "number" && interval > 0 ? interval : 5,
-      },
-      device_code,
-      async (deviceCode) => {
-        try {
-          return await this.#tokenRequest(async () => ({
-            grant_type: DEVICE_CODE,
-            device_code: deviceCode,
-            ...this.#sessionParam(),
-          }));
-        } catch (error) {
-          // Spec 4.4: this Session ID is dead, so forget it.
-          if (error instanceof PoppyError && SESSION_ENDED.has(error.error)) {
-            await this.#serial(() => this.#persist({ ...this.#state, sessionId: undefined }));
-          }
-          throw error;
-        }
-      },
-      (token) =>
-        this.#serial(async () => {
-          if (this.#signOuts === signOuts) return this.#applyToken(token, requested.join(" "));
-          if (token.refreshToken !== undefined)
-            await revokeAccountToken(this.#init, token.refreshToken);
-          throw new PoppyProtocolError("the Session signed out during Device Sign-In");
-        }),
-    );
+    this.#pendingIndex = run.catch(() => undefined);
+    return run;
   }
 
-  /** The User's sign-in link must be on the issuer host or a `poppy_domains` entry, or a subdomain. */
-  #signInUrl(value: unknown, what: string): string {
-    const url = httpsUrl(value, what);
-    if (url.username !== "" || url.password !== "") {
-      throw new PoppyProtocolError(`${what} must not contain credentials`);
+  /** @internal */
+  sessionInit(
+    company: Company,
+    userId: string,
+    anonymous = false,
+  ): {
+    keys: DelegatedKeys;
+    resolver: ResourceResolver;
+    fetch: Fetch;
+    operator: OperatorSignatureOptions | undefined;
+    allowPrivateAddresses: boolean;
+  } {
+    // One set of delegated keys per User ID, so no key signs for two (spec 5.2). An anonymous User's
+    // keys live only as long as its PoppyUser, so they're discarded with it (spec 5.1).
+    const keysKey = JSON.stringify([company.identifier, userId]);
+    let keys = anonymous ? undefined : this.#keys.get(keysKey);
+    if (keys === undefined) {
+      keys = new DelegatedKeys(this.clientId, this.#signer, this.#delegationLifetime);
+      if (!anonymous) this.#keys.set(keysKey, keys);
     }
-    const host = url.hostname;
-    const allowed = [new URL(this.company.issuer).hostname, ...this.company.poppyDomains];
-    if (!allowed.some((domain) => host === domain || host.endsWith(`.${domain}`))) {
-      throw new PoppyProtocolError(`${what} host ${host} is not the issuer or in poppy_domains`);
+    const resolverKey = `${company.identifier} ${company.domain}`;
+    let resolver = this.#resolvers.get(resolverKey);
+    if (resolver === undefined) {
+      resolver = new ResourceResolver(company, this.#fetch, this.#allowPrivate);
+      this.#resolvers.set(resolverKey, resolver);
     }
-    return url.href;
+    return {
+      keys,
+      resolver,
+      fetch: this.#fetch,
+      operator: this.#operator,
+      allowPrivateAddresses: this.#allowPrivate,
+    };
+  }
+
+  /** @internal */
+  get defaultRedirectUri(): string | undefined {
+    return this.#redirectUri;
+  }
+}
+
+function checkRedirectUri(uri: string): void {
+  if (!isLoopbackRedirect(uri)) httpsUrl(uri, "redirectUri");
+}
+
+interface PoppyUserInit {
+  company: Company;
+  localUserId: string | undefined;
+  userId: string;
+  agentId: string | undefined;
+  accountName: string | undefined;
+  agentName: string | undefined;
+  account: Account | undefined;
+}
+
+/** One of your Users at one Company, in one account. Get one from {@link PoppyAgent.user}. */
+export class PoppyUser {
+  readonly company: Company;
+  /** The pairwise User ID the Company sees (spec 5.1). Keep the mapping confidential. */
+  readonly userId: string;
+  readonly agentId: string | undefined;
+  /** True for {@link PoppyAgent.anonymousUser}, which never sends an access token (spec 5.4). */
+  readonly anonymous: boolean;
+  readonly #agent: PoppyAgent;
+  readonly #init: PoppyUserInit;
+  #anonymousInit: ReturnType<PoppyAgent["sessionInit"]> | undefined;
+
+  constructor(agent: PoppyAgent, init: PoppyUserInit) {
+    this.#agent = agent;
+    this.#init = init;
+    this.company = init.company;
+    this.userId = init.userId;
+    this.agentId = init.agentId;
+    this.anonymous = init.localUserId === undefined;
+  }
+
+  /** Whether this account holds a refresh token (spec 4.4). */
+  get signedIn(): boolean {
+    return this.#init.account?.signedIn === true;
+  }
+
+  /** The scopes of the refresh token. Empty when signed out. */
+  get scope(): string[] {
+    return this.#init.account?.scope ?? [];
   }
 
   /**
-   * Revokes the Account Token (spec 4.9); the Session continues signed out. A pending Device Sign-In
-   * that completes later is revoked and rejects.
+   * Starts a new Session with a fresh random `sid` (spec 5.2). Run several for tasks in parallel. Sessions
+   * share this account's sign-in.
    */
-  signOut(): Promise<void> {
-    return this.#serial(() => this.#signOut());
+  session(): Session {
+    return new Session({
+      company: this.company,
+      clientId: this.#agent.clientId,
+      userId: this.userId,
+      agentId: this.agentId,
+      account: this.#init.account,
+      ...this.#sessionInit(),
+    });
   }
 
-  async #signOut(): Promise<void> {
-    this.#signOuts += 1;
-    const token = this.#state.accountToken;
-    if (token === undefined) return;
-    await revokeAccountToken(this.#init, token);
-    await this.#forgetAccount();
+  #sessionInit(): ReturnType<PoppyAgent["sessionInit"]> {
+    if (!this.anonymous) return this.#agent.sessionInit(this.company, this.userId);
+    this.#anonymousInit ??= this.#agent.sessionInit(this.company, this.userId, true);
+    return this.#anonymousInit;
   }
 
-  static {
-    closeSession = (session) =>
-      session.#serial(async () => {
-        try {
-          await session.#signOut();
-        } finally {
-          forgotten.add(session);
-        }
+  /** @internal */
+  accountFor(): Account {
+    if (this.anonymous) throw new PoppyProtocolError("an anonymous User can't sign in (spec 5.4)");
+    requireOAuth(this.company);
+    const account = this.#init.account;
+    if (account === undefined)
+      throw new PoppyProtocolError(`${this.company.domain} offers no sign-in`);
+    return account;
+  }
+
+  /**
+   * Starts Direct Sign-In (spec 4.2): open `url` in the User's browser, then pass the URL their browser is
+   * sent back to {@link completeDirectSignIn} or {@link PoppyAgent.completeDirectSignIn}. Requests the
+   * scopes already held too, unless `replaceScopes`, since the new refresh token replaces the old (4.7).
+   * Only for a User who signs in themselves (spec 5.4).
+   */
+  startDirectSignIn(options: {
+    scope: string | readonly string[];
+    redirectUri?: string;
+    replaceScopes?: boolean;
+  }): Promise<{ url: string; state: string }> {
+    const account = this.accountFor();
+    const redirectUri = options.redirectUri ?? this.#agent.defaultRedirectUri;
+    if (redirectUri === undefined)
+      throw new PoppyProtocolError("Direct Sign-In needs a redirectUri");
+    checkRedirectUri(redirectUri);
+    return account
+      .startDirect(
+        {
+          scope: options.scope,
+          redirectUri,
+          ...(options.replaceScopes === undefined ? {} : { replaceScopes: options.replaceScopes }),
+        },
+        {
+          localUserId: this.#init.localUserId ?? "",
+          account: this.#init.accountName ?? "default",
+          agent: this.#init.agentName,
+        },
+      )
+      .then(async (started) => {
+        await this.#agent.trackPendingSignIn(started.state, Date.now() + PENDING_LIFETIME);
+        return started;
       });
   }
-}
 
-/** What to show the User for a pending {@link DeviceSignIn} (RFC 8628 section 3.2). */
-export interface DeviceSignInDetails {
-  userCode: string;
-  verificationUri: string;
-  verificationUriComplete: string | undefined;
-  /** Seconds until the request expires. */
-  expiresIn: number;
-  /** Seconds between polls. */
-  interval: number;
-}
-
-/** The device code stays private to this object. */
-export class DeviceSignIn {
-  readonly userCode: string;
-  readonly verificationUri: string;
-  readonly verificationUriComplete: string | undefined;
-  readonly expiresIn: number;
-  #interval: number;
-  readonly #deviceCode: string;
-  readonly #poll: (deviceCode: string) => Promise<TokenResponse>;
-  readonly #complete: (token: TokenResponse) => Promise<string>;
-  readonly #deadline: number;
-
-  constructor(
-    details: DeviceSignInDetails,
-    deviceCode: string,
-    poll: (deviceCode: string) => Promise<TokenResponse>,
-    complete: (token: TokenResponse) => Promise<string>,
-  ) {
-    this.userCode = details.userCode;
-    this.verificationUri = details.verificationUri;
-    this.verificationUriComplete = details.verificationUriComplete;
-    this.expiresIn = details.expiresIn;
-    this.#interval = details.interval;
-    this.#deviceCode = deviceCode;
-    this.#poll = poll;
-    this.#complete = complete;
-    this.#deadline = Date.now() + details.expiresIn * 1000;
+  /** Finishes Direct Sign-In for this User. See {@link PoppyAgent.completeDirectSignIn}. */
+  async completeDirectSignIn(callbackUrl: string | URL): Promise<{ scope: string[] }> {
+    const { user, scope } = await this.#agent.completeDirectSignIn(this.company, callbackUrl);
+    if (user !== this) throw new PoppyProtocolError("the sign-in was started for another User");
+    return { scope };
   }
 
   /**
-   * Polls until the User finishes, then signs the Session in. Resolves with the granted scopes, which may be
-   * fewer than requested (spec 4.4). Rejects with `access_denied` or `expired_token`, or the signal's reason.
+   * Starts Device Sign-In (spec 4.3). Show the User the Company's name and domain with `verificationUri`
+   * and `userCode`, then call {@link DeviceSignIn.wait}. Prefer Direct Sign-In when you can.
    */
-  async wait(options: { signal?: AbortSignal } = {}): Promise<{ scope: string }> {
-    for (;;) {
-      if (Date.now() + this.#interval * 1000 > this.#deadline)
-        throw new PoppyError("expired_token");
-      await sleep(this.#interval * 1000, options.signal);
-      try {
-        const token = await this.#poll(this.#deviceCode);
-        return { scope: await this.#complete(token) };
-      } catch (error) {
-        if (!(error instanceof PoppyError)) throw error;
-        if (error.error === "slow_down") this.#interval += 5;
-        else if (error.error !== "authorization_pending") throw error;
-      }
-    }
+  startDeviceSignIn(options: {
+    scope: string | readonly string[];
+    replaceScopes?: boolean;
+  }): Promise<DeviceSignIn> {
+    return this.accountFor().startDevice(options);
+  }
+
+  /**
+   * Mediated Sign-In (extension, transitional): signs in with credentials the User gave you for this
+   * Company, chosen by its issuer. Prefer Direct or Device Sign-In whenever the Company offers them.
+   */
+  mediatedSignIn(options: {
+    scope: string | readonly string[];
+    credentials: Readonly<Record<string, string>>;
+  }): Promise<MediatedSignInResult> {
+    return this.accountFor().mediated(options);
+  }
+
+  /** Signs out (spec 5.5): revokes the refresh token. Sessions continue signed out. */
+  async signOut(): Promise<void> {
+    if (this.#init.account === undefined) return;
+    await this.#init.account.signOut();
+    await this.#agent.dropPendingSignIns(
+      this.company.identifier,
+      this.#init.localUserId ?? "",
+      this.#init.accountName ?? "default",
+    );
   }
 }

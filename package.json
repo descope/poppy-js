@@ -1,6 +1,6 @@
 {
   "name": "@descope/poppy",
-  "version": "0.0.0",
+  "version": "1.0.0",
   "description": "TypeScript Personal Agent SDK for the Personal Agent Protocol (Poppy) draft 0.3: discovery, delegated Session JWTs, Direct, Device and Mediated Sign-In, APIs, browser join, conversations, task coverage and operations.",
   "keywords": [
     "agent",

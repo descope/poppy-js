@@ -441,3 +441,142 @@ describe("scopes (spec 3.2, 4.7)", () => {
     ]);
   });
 });
+
+describe("review findings (PR #15)", () => {
+  it("rechecks the destination against the new version's document before resending", async () => {
+    // tasks.endpoint is a 0.4 destination and doesn't exist on 0.3, so after the downgrade this
+    // URL is one the new document doesn't list (spec 5.2).
+    const { session } = await setup({
+      version: "0.4",
+      versionUnsupported: true,
+      versionAfterError: "0.3",
+    });
+    await expect(session.fetch(TASKS)).rejects.toThrow(/is not an API or endpoint/);
+    expect(session.protocolVersion).toBe("0.3");
+  });
+
+  it("doesn't resend a body built for the version that went away", async () => {
+    const { session, mock } = await setup({
+      version: "0.4",
+      versionUnsupported: true,
+      versionAfterError: "0.3",
+    });
+    // A 0.4 conversation POST carries a top-level id and a message with none, which is the wrong
+    // shape for 0.3. The Session moves version, and the caller rebuilds (spec 3.4, 8.3).
+    await expect(session.conversations().start({ text: "Hello" })).rejects.toMatchObject({
+      error: "version_unsupported",
+      protocolVersion: "0.3",
+    });
+    expect(session.protocolVersion).toBe("0.3");
+    // Sent once, under the version it was built for; never replayed to the other one.
+    expect(mock.requests.filter((r) => r.url === CONVERSATIONS)).toHaveLength(1);
+    expect(mock.declaredVersions).toEqual(["0.4"]);
+  });
+
+  it("keeps 0.3 skills and the feedback endpoint when the excluded tasks document fails", async () => {
+    const { session } = await setup({ version: "0.3", excludedTasksFails: true });
+    const coverage = await session.taskCoverage();
+    // Only the tasks needed that request; the other two are already in poppy.json (spec 9.1).
+    expect(coverage.excludedTasks).toEqual([]);
+    expect(coverage.feedbackEndpoint).toBe(FEEDBACK);
+    await expect(
+      session.sendFeedback({ task: "Pay with a gift card", description: "No API offered one." }),
+    ).resolves.toBeUndefined();
+  });
+
+  it("keeps the challenge's scope when a 403 carries a JSON body too", async () => {
+    // RFC 6750 servers often send both. The body names the error, the challenge the scope.
+    const error = await throwable(
+      new Response(JSON.stringify({ error: "insufficient_scope" }), {
+        status: 403,
+        headers: {
+          "content-type": "application/json",
+          "www-authenticate": 'Bearer error="insufficient_scope", scope="orders:write"',
+        },
+      }),
+    );
+    expect(error).toMatchObject({ error: "insufficient_scope", scope: "orders:write" });
+  });
+
+  it("doesn't hand a downgraded Session's resolver to the Company others still hold", async () => {
+    const { user, session } = await setup({
+      version: "0.4",
+      versionUnsupported: true,
+      versionAfterError: "0.3",
+    });
+    await expect(session.fetch(TASKS)).rejects.toThrow(/is not an API or endpoint/);
+    // This PoppyUser still holds the 0.4 Company, so its next Session still reaches 0.4's endpoints.
+    const next = user.session();
+    expect(next.protocolVersion).toBe("0.4");
+    const response = await next.fetch(TASKS);
+    await response.body?.cancel();
+    expect(response.status).toBe(200);
+  });
+
+  it("ignores a supported_versions entry for the document's own version", async () => {
+    // Following a link for the version already in hand would fetch a second copy, and could fail
+    // over one that is broken (spec 3.4).
+    const { company, mock } = await setup({
+      version: "0.4",
+      poppy: (doc) => ({ ...doc, supported_versions: { "0.4": LINKED_DOC } }),
+    });
+    expect(company.protocolVersion).toBe("0.4");
+    expect(company.supportedVersions).toEqual({});
+    expect(mock.requests.some((r) => r.url === LINKED_DOC)).toBe(false);
+  });
+
+  it("falls back when a linked document fails a check beyond its version", async () => {
+    // The linked 0.4 document is a 0.4 document, but names another domain, so it is one this
+    // client must not use (spec 3.1) — and the published 0.3 document still works.
+    const { company } = await setup({
+      version: "0.3",
+      linkOtherVersion: true,
+      linkedDoc: (doc) => ({
+        ...doc,
+        organization: { name: "Example Company", domain: "elsewhere.test" },
+      }),
+    });
+    expect(company.protocolVersion).toBe("0.3");
+  });
+
+  it("gives a 0.4 state event the status its merged state implies", async () => {
+    const { session } = await setup({ version: "0.4" });
+    const { conversation } = await session.conversations().start({ text: "Hi" });
+    // A new conversation is working; a state event that says nothing about working leaves it so,
+    // and the event must not read as idle (spec 8.7).
+    const update = conversation.apply({
+      events: [
+        {
+          id: "evt_s1",
+          type: "state",
+          created_at: "2026-11-12T00:00:00Z",
+          handoff: "none",
+          responder: "agent",
+          closed: false,
+        },
+      ],
+      working: true,
+      handoff: "none",
+      responder: "agent",
+      closed: false,
+    });
+    expect(update.events[0]).toMatchObject({ type: "state", status: "working" });
+    expect(conversation.status).toBe("working");
+  });
+
+  it("yields working items when streaming falls back to polling", async () => {
+    const { session } = await setup({ version: "0.4", workingFirstRead: true });
+    const { conversation } = await session.conversations().start({ text: "Hi" });
+    const controller = new AbortController();
+    const seen: string[] = [];
+    for await (const item of conversation.stream({ signal: controller.signal })) {
+      seen.push(item.type);
+      // The Company doesn't stream, so working arrives from each read's body (spec 8.6).
+      if (item.type === "working" && !item.working) {
+        controller.abort();
+        break;
+      }
+    }
+    expect(seen).toContain("working");
+  });
+});

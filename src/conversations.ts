@@ -586,6 +586,10 @@ export class Conversation {
             responder: event.responder,
             closed: event.closed,
           };
+          // `status` is only knowable once the event is merged with the `working` its version
+          // doesn't report, or a 0.4 event on a working conversation would read as `idle`.
+          events.push({ ...event, status: statusFor(this.#state) });
+          continue;
         }
         events.push(event);
       }
@@ -785,13 +789,20 @@ export class Conversation {
       } else {
         const json: unknown = await response.json().catch(() => undefined);
         if (!isObject(json)) throw new PoppyProtocolError("events response must be a JSON object");
+        // A Company that doesn't stream reports `working` in each read's body rather than as an
+        // event, so changes to it are turned back into `working` items here (spec 8.6, 8.7).
+        let working = this.#state.working;
         let update = this.apply(json);
+        if (update.working !== working) yield { type: "working", working: update.working };
+        working = update.working;
         for (const event of update.events) yield { type: "event", event };
         while ((update.hasMore || !update.closed) && !signal?.aborted) {
           update = await this.read({
             wait: update.hasMore ? 0 : POLL_WAIT,
             ...(signal === undefined ? {} : { signal }),
           });
+          if (update.working !== working) yield { type: "working", working: update.working };
+          working = update.working;
           for (const event of update.events) yield { type: "event", event };
         }
         return;

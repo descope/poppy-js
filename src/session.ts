@@ -260,6 +260,18 @@ export class Session {
         this.#versionRetried = true;
         if (await this.#chooseVersionAgain()) {
           await response.body?.cancel();
+          // The new version's document is a different document: it may list other endpoints, and a
+          // body built for the old version is the wrong shape for this one. Both are checked again
+          // here rather than resending what was prepared for the version that just went away.
+          if (!(await this.#resolver.isDestination(url)))
+            throw new PoppyProtocolError(
+              `${url.origin}${url.pathname} is not an API or endpoint ${this.company.domain} lists at ${this.protocolVersion}`,
+            );
+          if (requestInit.body !== undefined)
+            throw new PoppyError("version_unsupported", {
+              description: `this Session moved to ${this.protocolVersion}; build the request again and send it`,
+              protocolVersion: this.protocolVersion,
+            });
           continue;
         }
       }
@@ -278,7 +290,8 @@ export class Session {
         if (challenge?.error === "invalid_token" && !tokenRetried) {
           tokenRetried = true;
           account.invalidate(choice);
-          if (challenge.resourceMetadata !== undefined) this.#init.resolver.forget(choice.service);
+          // The resolver this Session is using, which a version switch may have replaced.
+          if (challenge.resourceMetadata !== undefined) this.#resolver.forget(choice.service);
           // The retry refreshes. If refresh fails, the account is signed out and the retry goes
           // without a token (spec 5.5).
           await response.body?.cancel();
@@ -386,8 +399,11 @@ export class Session {
   async #fetchCoverage(): Promise<TaskCoverage> {
     const company = this.company;
     if (company.protocolVersion === "0.3") {
+      // Only the excluded tasks need a request on 0.3: the skills and the feedback endpoint are
+      // already in `poppy.json`, so a document that 404s or times out costs this Session the tasks
+      // and nothing else (spec 9.1).
       return {
-        excludedTasks: await this.#excludedTasksDocument(),
+        excludedTasks: await this.#excludedTasksDocument().catch(() => []),
         skills: company.skills,
         feedbackEndpoint: company.feedbackEndpoint,
       };
@@ -491,7 +507,11 @@ async function sessionError(response: Response, error: string): Promise<boolean>
  * A 403 is read from its JSON body first, since from 0.4 `extension_required` is a JSON body at APIs
  * too, rather than a challenge, and it isn't an access token error (spec 3.3, section 7). `approval_required`
  * already arrived that way. A 403 with only a challenge, such as 0.3's `extension_required` or
- * `insufficient_scope` on either version, still reads from the header.
+ * `insufficient_scope` on either version, reads from the header.
+ *
+ * A server may send both, as RFC 6750 servers often do for `insufficient_scope`. The body decides the
+ * error code, and the challenge fills in `scope` and `extension` when the body leaves them out, so the
+ * caller still learns which scope to request or which extension to declare.
  */
 export async function throwable(response: Response): Promise<PoppyError> {
   const challenge = authChallenge(response);
@@ -502,7 +522,18 @@ export async function throwable(response: Response): Promise<PoppyError> {
       .catch(() => undefined);
     if (isObject(body) && typeof body["error"] === "string") {
       await response.body?.cancel();
-      return errorFromBody(body, response);
+      return errorFromBody(
+        {
+          ...body,
+          ...(body["scope"] === undefined && challenge?.scope !== undefined
+            ? { scope: challenge.scope }
+            : {}),
+          ...(body["extension"] === undefined && challenge?.extension !== undefined
+            ? { extension: challenge.extension }
+            : {}),
+        },
+        response,
+      );
     }
   }
   if (challenge !== undefined && (response.status === 401 || response.status === 403)) {

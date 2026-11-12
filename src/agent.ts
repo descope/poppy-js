@@ -360,17 +360,30 @@ export class PoppyAgent {
     return run;
   }
 
+  /** Resolvers are shared per Company, and per version: each version lists its own endpoints. */
+  #resolverKey(company: Company): string {
+    return `${company.identifier} ${company.domain} ${company.protocolVersion}`;
+  }
+
   /**
    * Discovers a Company again, without a cached copy, and chooses a version again (spec 3.4). Its
    * resolver is replaced too, since another version's document can list other endpoints.
+   *
+   * Keyed by version, so a Session that moves to another version doesn't hand its resolver to the
+   * `PoppyUser`s still holding the Company it discovered first: that resolver knows that version's
+   * endpoints, and would make the other version's destinations unreachable.
    */
   #rediscover(company: Company): Promise<Rediscovered> {
     return discover(company.domain, {
       fetch: this.#fetch,
       allowPrivateAddresses: this.#allowPrivate,
     }).then((found) => {
-      const resolver = new ResourceResolver(found, this.#fetch, this.#allowPrivate);
-      this.#resolvers.set(`${found.identifier} ${found.domain}`, resolver);
+      const key = this.#resolverKey(found);
+      let resolver = this.#resolvers.get(key);
+      if (resolver === undefined) {
+        resolver = new ResourceResolver(found, this.#fetch, this.#allowPrivate);
+        this.#resolvers.set(key, resolver);
+      }
       return { company: found, resolver };
     });
   }
@@ -397,7 +410,7 @@ export class PoppyAgent {
       keys = new DelegatedKeys(this.clientId, this.#signer, this.#delegationLifetime);
       if (!anonymous) this.#keys.set(keysKey, keys);
     }
-    const resolverKey = `${company.identifier} ${company.domain}`;
+    const resolverKey = this.#resolverKey(company);
     let resolver = this.#resolvers.get(resolverKey);
     if (resolver === undefined) {
       resolver = new ResourceResolver(company, this.#fetch, this.#allowPrivate);

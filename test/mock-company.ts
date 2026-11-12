@@ -39,6 +39,10 @@ export interface MockOptions {
   versionAfterError?: "0.3" | "0.4";
   /** The body the 0.4 tasks endpoint answers with (spec section 9). */
   tasks?: Record<string, unknown>;
+  /** The 0.3 excluded tasks document answers 404, as a Company that moved it would. */
+  excludedTasksFails?: boolean;
+  /** Report `working: true` on the first events read of a conversation, then false. */
+  workingFirstRead?: boolean;
   /** Token type the server issues; `DPoP` also requires a proof. */
   tokenType?: "Bearer" | "DPoP";
   /** Return a new refresh token on every refresh. */
@@ -99,6 +103,7 @@ export class MockCompany {
   /** Fail the next resource request with invalid_token. */
   rejectNextToken = false;
   #counter = 0;
+  #reads = 0;
   #nonceIssued = false;
 
   constructor(agentKey: CryptoKeyPair, options: MockOptions = {}) {
@@ -217,6 +222,7 @@ export class MockCompany {
       case LINKED_DOC:
         return json(200, this.linkedJson());
       case EXCLUDED_TASKS:
+        if (this.options.excludedTasksFails === true) return json(404, { error: "not_found" });
         return json(200, { tasks: [{ task: "Send a wire transfer" }] });
       case TASKS:
         return this.#resource(url, method, headers, undefined, undefined, () =>
@@ -307,9 +313,11 @@ export class MockCompany {
       .split("/")
       .filter(Boolean);
     const isV4 = this.version !== "0.3";
+    // One Company that keeps working over the first read, so a reader sees it stop (spec 8.7).
+    const working = this.options.workingFirstRead === true && this.#reads++ === 0;
     const state = isV4
-      ? { working: false, handoff: "none", responder: "agent", closed: false }
-      : { status: "idle", responder: "agent" };
+      ? { working, handoff: "none", responder: "agent", closed: false }
+      : { status: working ? "working" : "idle", responder: "agent" };
     if (method !== "POST" && !(rest[1] === "events" && method === "GET"))
       return json(404, { error: "not_found" });
     const id = rest[0] ?? `cnv_${++this.#counter}`;

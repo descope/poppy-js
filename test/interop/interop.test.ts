@@ -113,7 +113,7 @@ describe("discovery against the conformance fake", () => {
     expect(company.apis.map((api) => api.type)).toContain("mcp");
     expect(company.browserSessionEndpoint).toBe("https://shop.test/poppy/browser-session");
     expect(company.feedbackEndpoint).toBe("https://shop.test/poppy/feedback");
-    expect(company.extensions["shop.test/gift-wrap"]?.version).toBe("1");
+    expect(company.extensions["shop.test/gift-wrap"]?.[0]?.version).toBe("1");
   });
 
   it.each<[string, Flaws]>([
@@ -220,9 +220,9 @@ describe("conversations against the conformance fake", () => {
     expect(next.events.map((e) => e.type)).toEqual(["message"]);
     expect((await conversation.read()).events).toEqual([]);
 
-    expect(await conversation.handoff()).toEqual({ status: "queued", responder: "human" });
-    const closed = await conversation.close();
-    expect(closed.status).toBe("closed");
+    expect(await conversation.handoff()).toMatchObject({ handoff: "pending", responder: "human" });
+    await conversation.close();
+    expect(conversation.closed).toBe(true);
     await expect(conversation.send({ text: "Hello?" })).rejects.toMatchObject({
       error: "conversation_closed",
       status: 409,

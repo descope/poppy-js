@@ -14,7 +14,7 @@ import { isLoopbackRedirect } from "./metadata.ts";
 import { requireOAuth } from "./oauth.ts";
 import type { OperatorSignatureOptions } from "./operator.ts";
 import { ResourceResolver } from "./resources.ts";
-import { Session } from "./session.ts";
+import { type Rediscovered, Session } from "./session.ts";
 import { DelegatedKeys } from "./session-jwt.ts";
 import { MemoryStore, type Store } from "./store.ts";
 
@@ -34,8 +34,12 @@ export interface PoppyAgentOptions {
   /** The default `redirect_uri` for Direct Sign-In, one of your `redirect_uris` (spec 4.2). */
   redirectUri?: string;
   /**
-   * Extensions you list in your client metadata (spec 3.3), such as `{ operations: { version: "2" } }`.
-   * Keep it the same as the document, so the Company and this client agree on what you support.
+   * The extensions you support, by name, such as `{ operations: { version: "2" } }` (spec 3.3).
+   *
+   * On 0.3 you also list them in your client metadata document, so keep the two the same. From 0.4 the
+   * client metadata has no `extensions`: each request declares the ones you use with that Company in
+   * `Poppy-Extensions`, and this SDK declares those a Company also lists, the same throughout a Session
+   * (spec 3.4).
    */
   extensions?: Readonly<Record<string, { version: string }>>;
   /** Seconds each delegation lasts, at most 24 hours (spec 5.2). Defaults to one hour. */
@@ -356,6 +360,21 @@ export class PoppyAgent {
     return run;
   }
 
+  /**
+   * Discovers a Company again, without a cached copy, and chooses a version again (spec 3.4). Its
+   * resolver is replaced too, since another version's document can list other endpoints.
+   */
+  #rediscover(company: Company): Promise<Rediscovered> {
+    return discover(company.domain, {
+      fetch: this.#fetch,
+      allowPrivateAddresses: this.#allowPrivate,
+    }).then((found) => {
+      const resolver = new ResourceResolver(found, this.#fetch, this.#allowPrivate);
+      this.#resolvers.set(`${found.identifier} ${found.domain}`, resolver);
+      return { company: found, resolver };
+    });
+  }
+
   /** @internal */
   sessionInit(
     company: Company,
@@ -367,6 +386,8 @@ export class PoppyAgent {
     fetch: Fetch;
     operator: OperatorSignatureOptions | undefined;
     allowPrivateAddresses: boolean;
+    extensions: Readonly<Record<string, { version: string }>>;
+    rediscover: () => Promise<Rediscovered>;
   } {
     // One set of delegated keys per User ID, so no key signs for two (spec 5.2). An anonymous User's
     // keys live only as long as its PoppyUser, so they're discarded with it (spec 5.1).
@@ -388,6 +409,8 @@ export class PoppyAgent {
       fetch: this.#fetch,
       operator: this.#operator,
       allowPrivateAddresses: this.#allowPrivate,
+      extensions: this.extensions,
+      rediscover: () => this.#rediscover(company),
     };
   }
 

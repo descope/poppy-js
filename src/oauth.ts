@@ -1,7 +1,7 @@
 import type { Company, OAuthServer } from "./discovery.ts";
 import { DpopKey } from "./dpop.ts";
 import { errorFromResponse, PoppyError, PoppyProtocolError } from "./errors.ts";
-import { type Fetch, isObject, isRedirect, postForm } from "./http.ts";
+import { type Fetch, isObject, isRedirect, originOf, postForm } from "./http.ts";
 import { nowSeconds, randomId, type Signer, signJwt } from "./jose.ts";
 
 const CLIENT_ASSERTION_TYPE = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
@@ -139,10 +139,15 @@ export async function revokeRefreshToken(context: OAuthContext, token: string): 
 }
 
 /**
- * Checks a link the User will open for Device Sign-In (spec 4.3): its host must be the issuer's host or
- * the host of a URL in `protected_resources`, or a subdomain of either.
+ * Checks a link the User will open for Device Sign-In (spec 4.3).
+ *
+ * From 0.4 its host must be the issuer's host or `organization.domain`, or a subdomain of either. The
+ * hosts of the issuer's other `protected_resources` no longer qualify: that list can name domains that
+ * share the issuer and services such as MCP servers, so a link there could pass off a page the Company
+ * doesn't control as its sign-in page. On 0.3 those hosts are still allowed, as that version says.
  */
-export function checkSignInUrl(oauth: OAuthServer, value: unknown, what: string): string {
+export function checkSignInUrl(company: Company, value: unknown, what: string): string {
+  const oauth = requireOAuth(company);
   if (typeof value !== "string") throw new PoppyProtocolError(`${what} is missing`);
   let url: URL;
   try {
@@ -153,7 +158,11 @@ export function checkSignInUrl(oauth: OAuthServer, value: unknown, what: string)
   if (url.protocol !== "https:") throw new PoppyProtocolError(`${what} must use https`);
   if (url.username !== "" || url.password !== "")
     throw new PoppyProtocolError(`${what} must not contain credentials`);
-  const allowed = [oauth.issuer, ...oauth.protectedResources].flatMap((entry) => {
+  const sources =
+    company.protocolVersion === "0.3"
+      ? [oauth.issuer, ...oauth.protectedResources]
+      : [oauth.issuer, originOf(company.domain)];
+  const allowed = sources.flatMap((entry) => {
     try {
       return [new URL(entry).hostname.toLowerCase()];
     } catch {
@@ -162,7 +171,9 @@ export function checkSignInUrl(oauth: OAuthServer, value: unknown, what: string)
   });
   const host = url.hostname.toLowerCase();
   if (!allowed.some((domain) => host === domain || host.endsWith(`.${domain}`)))
-    throw new PoppyProtocolError(`${what} host ${host} is not the Company's issuer or a resource`);
+    throw new PoppyProtocolError(
+      `${what} host ${host} is not the Company's issuer or ${company.domain}`,
+    );
   return url.href;
 }
 

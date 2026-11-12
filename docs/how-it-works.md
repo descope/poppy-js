@@ -1,6 +1,6 @@
 # How it works
 
-This page follows a request from discovery to a signed-in API call, then covers the rest of the protocol: browser join, conversations and operations. Section numbers refer to [spec draft 0.3](https://personalagentprotocol.org/docs/spec.md).
+This page follows a request from discovery to a signed-in API call, then covers the rest of the protocol: browser join, conversations and operations. Section numbers refer to [spec 0.4](https://personalagentprotocol.org/docs/0.4/spec), and name 0.3 where the two differ.
 
 - [The parties](#the-parties)
 - [Discovery](#discovery)
@@ -45,7 +45,7 @@ sequenceDiagram
 
     SDK->>Domain: GET /.well-known/poppy.json
     Domain-->>SDK: poppy.json (redirects must end at the well-known path)
-    Note over SDK: protocol_version is 0.3<br/>organization.domain is the host that served it
+    Note over SDK: the newest version both serve<br/>organization.domain is the host that served it
     SDK->>Domain: GET /.well-known/oauth-protected-resource
     Domain-->>SDK: resource, authorization_servers
     Note over SDK: 404 or no servers: no issuer, signed-out only<br/>several servers: auth.issuer picks one
@@ -59,10 +59,29 @@ The domain names its issuer, and the issuer lists the domain back, so one domain
 - `identifier`: the issuer, or `https://{domain}` for a Company without one. Session JWTs are addressed to it, and User IDs are scoped by it.
 - `name`, `domain` and `logoUri`, which you show the User together.
 - `signIn`: which of Direct, Device and Mediated Sign-In the Company offers. All of them are off when the Company sets `auth.disabled`, and the SDK then refuses to start sign-in (spec 3.2).
-- `apis`, `conversationProtocols`, `browserSessionEndpoint`, `feedbackEndpoint`, `excludedTasksUrl` and `extensions`.
-- `scopes` and `scopeHints`, which describe what each scope allows.
-- `skills`, from the Company's `skill_index` (spec 9.4). `session.fetchSkill(name)` fetches one with no credentials and checks its digest. A skill explains how to do a task through the Company's APIs, but it grants no access and no approval.
+- `protocolVersion`: the version negotiated with this Company, which everything below follows.
+- `apis`, `conversationProtocols`, `browserSessionEndpoint` and `extensions`.
+- `scopes` and `scopeHints`, which describe what each scope allows. `supportedScopes(company)` adds the scopes the issuer and the domain's protected resource metadata list, either of which may name one from 0.4.
+- `tasksEndpoint` on 0.4, or `feedbackEndpoint`, `excludedTasksUrl` and `skills` on 0.3. Read them through `session.taskCoverage()`, which works the same on both. `session.fetchSkill(name)` fetches a skill with no credentials and checks its digest. A skill explains how to do a task through the Company's APIs, but it grants no access and no approval (spec 9.4).
 - `ucp`, when the Company lists the UCP extension. See [UCP](ucp.md).
+
+### Protocol versions
+
+A Company serves one version in `poppy.json` and may list others in `supported_versions`, each mapped to that version's document (spec 3.4). `discover()` picks the newest of them this SDK implements — `SUPPORTED_PROTOCOL_VERSIONS` is `["0.4", "0.3"]` — and reads that version's document. A linked document is used only when its URL is HTTPS on the host that served `poppy.json`, it doesn't redirect, it carries the `protocol_version` it was listed under, and it has no `supported_versions` of its own; one that fails any of these is dropped, and the next newest version is used instead.
+
+`company.protocolVersion` records what was chosen, and from 0.4 every request with the Session header carries it in `Poppy-Version`, with the extensions the agent uses in `Poppy-Extensions`, the same throughout a Session. If a Company answers `version_unsupported`, `session.fetch()` discovers it again without a cached copy and, when that chooses another version, continues in a new Session at that version and sends the request once more.
+
+Two areas behave differently on each version, and the SDK gives you one API for both:
+
+|                       | 0.3                                                                         | 0.4                                                                                   |
+| --------------------- | --------------------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
+| Task coverage         | `excluded_tasks.url`, `skill_index` and `feedback.endpoint` in `poppy.json` | one `tasks.endpoint`, fetched per Session with the Session header and no access token |
+| Conversation state    | one `status`: `working`, `idle`, `queued` or `closed`                       | `working`, `handoff`, `responder` and `closed`, which can hold at once                |
+| Conversation requests | each message carries its own `id`                                           | every POST carries a request `id`, and a message's ID is its request's                |
+| Withdrawing a handoff | not available                                                               | `conversation.cancelHandoff()`                                                        |
+| Extensions            | listed in your client metadata document                                     | declared per request in `Poppy-Extensions`                                            |
+
+`conversation.status` still reports a 0.3 status on both versions, derived from the state, so code written for 0.3 keeps working.
 
 ## Users, Sessions and the Session header
 
@@ -227,30 +246,32 @@ sequenceDiagram
     participant SDK as Poppy SDK
     participant CA as Company Agent
 
-    SDK->>CA: POST {endpoint} first message
-    CA-->>SDK: 201 conversation_id, status working
+    SDK->>CA: POST {endpoint} first message, with a request id
+    CA-->>SDK: 201 conversation_id
     SDK->>CA: GET {endpoint}/{id}/events (SSE or long poll)
-    CA-->>SDK: message events, text-delta pieces, state idle
+    CA-->>SDK: message events, text-delta pieces, working false
     CA-->>SDK: authorization event: scopes needed
     Note over SDK: sign in, then continue with the access token
     SDK->>CA: POST {endpoint}/{id}/messages
     CA-->>SDK: user_requested event: wants the User
     SDK->>CA: POST {endpoint} with parent_conversation_id<br/>and user_requested_event_id (Direct Conversation)
     SDK->>CA: POST {endpoint}/{id}/handoff
-    CA-->>SDK: status queued, then responder human
+    CA-->>SDK: handoff pending, then responder human
     SDK->>CA: POST {endpoint}/{id}/close
 ```
 
 - `conversation.stream()` reads events as server-sent events, reconnecting with `Last-Event-ID`, and falls back to long polling for Companies that don't stream.
 - Events are handled in order and never twice. Save `conversation.id`, `cursor` and `handledEventIds` to resume in another Session with `conversations.resume()`.
-- To retry a message after a failure, send it again with the same `id`. The Company won't add it twice.
+- `conversation.state` reports `working`, `handoff`, `responder` and `closed` on both versions; on 0.3 they're derived from `status`, which is still there as a getter. Read until `working` is false to get the Company's whole reply, and before closing, since from 0.4 a close doesn't wait its turn (spec 8.7, 8.12).
+- To retry a request after a failure, send it again with the same `id`: on 0.3 that is the message's ID, and from 0.4 the request's, which the message takes as its own. The Company won't act on it twice. Each of `send()`, `handoff()`, `cancelHandoff()` and `close()` takes one.
+- `conversation.cancelHandoff()` withdraws a request for a person, from 0.4. The Company may stop looking or keep looking, so read `handoff` and `responder` for the outcome rather than depending on the cancel (spec 8.9).
 - `author.type` is `human` only for the User's own words, and is the default in Direct Conversations.
 - To accept a `user_requested` event, you can call `conversation.openDirect(message, { userRequestedEventId })`. The message is optional. Without one, the Company speaks first (spec 8.10).
 - Content that an extension defines travels in a message's `extensions` (spec 8.4). The SDK reads `message.operation` from the Operations extension, `message.links` from the Links extension, and `message.disclosures` from the Disclosures extension. Links and disclosures are Company content, so you decide whether and how to show them. Showing each link's domain helps the User see where it goes.
 
 ## Operations
 
-With the Operations extension, a Company asks for the User's approval of exact terms before an action such as an exchange or a payment. Your agent lists `operations` version `2` in its client metadata and in `extensions` on the `PoppyAgent`.
+With the Operations extension, a Company asks for the User's approval of exact terms before an action such as an exchange or a payment. Your agent lists `operations` version `2` in `extensions` on the `PoppyAgent`, and, on 0.3, in its client metadata document. From 0.4 it is declared per request in `Poppy-Extensions` instead, which the SDK sends for you.
 
 ```mermaid
 sequenceDiagram

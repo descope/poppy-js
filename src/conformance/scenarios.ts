@@ -22,10 +22,17 @@ export type Step =
    * Send a request the Company refuses with `approval_required`, approve the operation as if the User
    * said yes, and send it again with the approval.
    */
-  | { action: "request_with_approval"; url: string; method: string; body: string };
+  | { action: "request_with_approval"; url: string; method: string; body: string }
+  /**
+   * Read the Company's task coverage for this Session: its excluded tasks, its skills and where to send
+   * feedback. On 0.4 that is a GET to `tasks.endpoint` with the Session header and no access token.
+   */
+  | { action: "task_coverage" }
+  /** Report a task the User couldn't do, to the feedback endpoint the Company names (spec 9.3). */
+  | { action: "report_task"; task: string; description: string };
 
 /** Which parts of the protocol a scenario exercises. */
-export type Suite = "core" | "oauth" | "interactions";
+export type Suite = "core" | "oauth" | "interactions" | "versions";
 
 /** A scenario: how the Company behaves, what the agent does, and the checks it decides. */
 export interface ScenarioDefinition {
@@ -226,6 +233,84 @@ export const SCENARIOS: readonly ScenarioDefinition[] = [
     suite: "oauth",
     company: { dpop: true },
     steps: [discover, { action: "sign_in", scopes: ["orders:read"] }, orders],
+  },
+
+  // 0.4. These run beside the 0.3 scenarios above, since a Company serves one version while an agent
+  // meets many, and both versions are published and frozen.
+  {
+    name: "v04-signed-out",
+    description:
+      "0.4: signed-out requests, task coverage per Session, feedback, and a conversation with request IDs.",
+    suite: "interactions",
+    company: { version: "0.4" },
+    steps: [
+      discover,
+      { action: "task_coverage" },
+      orders,
+      { action: "converse", text: "Do you have the jacket in medium?" },
+      {
+        action: "report_task",
+        task: "Pay with a gift card",
+        description: "No API or conversation offered a way to use a gift card.",
+      },
+    ],
+  },
+  {
+    name: "v04-sign-in",
+    description: "0.4: Direct Sign-In, an MCP resource token, an operation, and sign-out.",
+    suite: "oauth",
+    company: { version: "0.4", rotate: true, expireTokensOnce: true },
+    steps: [
+      discover,
+      { action: "sign_in", scopes: ["orders:read", "orders:write"] },
+      { action: "task_coverage" },
+      orders,
+      {
+        action: "request",
+        url: MCP,
+        method: "POST",
+        body: '{"jsonrpc":"2.0","id":1,"method":"tools/list"}',
+      },
+      {
+        action: "request_with_approval",
+        url: `${API}/exchanges`,
+        method: "POST",
+        body: '{"item":"itm_1"}',
+      },
+      { action: "sign_out" },
+    ],
+  },
+  {
+    name: "v04-chosen-over-0.3",
+    description: "poppy.json is the 0.3 document and supported_versions links the 0.4 one.",
+    suite: "versions",
+    company: { version: "0.4", linkPreferredVersion: true },
+    steps: [discover, orders],
+    evaluate: (c) => c.checkVersionSelection(),
+  },
+  {
+    name: "v04-linked-on-another-host",
+    description: "supported_versions links the 0.4 document to a file on another host.",
+    suite: "versions",
+    company: { version: "0.4", linkedVersionOffsite: true },
+    steps: [discover, orders],
+    evaluate: (c) => c.checkVersionSelection(),
+  },
+  {
+    name: "v04-linked-version-mismatch",
+    description: "The document listed under 0.4 declares protocol_version 0.3.",
+    suite: "versions",
+    company: { version: "0.4", linkedVersionMismatch: true },
+    steps: [discover, orders],
+    evaluate: (c) => c.checkVersionSelection(),
+  },
+  {
+    name: "v04-version-unsupported",
+    description: "Every request with the Session header is refused with version_unsupported.",
+    suite: "versions",
+    company: { version: "0.4", versionUnsupported: true },
+    steps: [discover, orders],
+    evaluate: (c) => c.checkVersionErrors(),
   },
 ];
 

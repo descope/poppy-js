@@ -65,6 +65,42 @@ export const CHECKS: readonly Check[] = [
     title: "Doesn't connect to a private or loopback address a Company names",
   },
 
+  // Versions (0.4)
+  {
+    id: "versions.selection",
+    section: "3.4",
+    level: "MUST",
+    title:
+      "Chooses the newest version it supports from protocol_version and supported_versions, and uses that version's document",
+  },
+  {
+    id: "versions.linked-host",
+    section: "3.4",
+    level: "MUST",
+    title: "Doesn't use a supported_versions document on another host",
+  },
+  {
+    id: "versions.linked-version",
+    section: "3.4",
+    level: "MUST",
+    title:
+      "Doesn't use a supported_versions document whose protocol_version isn't the version it was listed under",
+  },
+  {
+    id: "versions.header",
+    section: "3.4",
+    level: "MUST",
+    title:
+      "Sends Poppy-Version on every request with the Session header, naming a version the Company serves, the same throughout a Session",
+  },
+  {
+    id: "versions.unsupported",
+    section: "3.4",
+    level: "MUST",
+    title:
+      "Fetches poppy.json again after version_unsupported, and stops when it chooses the same version",
+  },
+
   // Sessions
   {
     id: "session.header",
@@ -210,12 +246,35 @@ export const CHECKS: readonly Check[] = [
     title: "Doesn't send a token or Session JWT to the target of a redirect",
   },
 
+  // Task coverage
+  {
+    id: "tasks.session",
+    section: "9",
+    level: "MUST",
+    title: "Gets tasks.endpoint with a GET and the Session header, and sends no access token (0.4)",
+  },
+
   // Conversations
   {
     id: "conversation.messages",
     section: "8.2, 8.4",
     level: "MUST",
     title: "Messages have a valid, unique id and an author.type, and have content",
+  },
+  {
+    id: "conversation.request-id",
+    section: "8.3",
+    level: "MUST",
+    title:
+      "Every conversation POST carries a unique top-level request id, and its message carries none of its own (0.4)",
+  },
+
+  // Extensions
+  {
+    id: "extensions.declared",
+    section: "3.3, 3.4",
+    level: "MUST",
+    title: "Declares the extensions it uses in Poppy-Extensions, as an RFC 9651 List (0.4)",
   },
 
   // Operations extension

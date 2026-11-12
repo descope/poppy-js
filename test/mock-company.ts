@@ -11,12 +11,34 @@ export const API = "https://api.example.com";
 export const MCP = "https://mcp.example.com/mcp";
 export const CONVERSATIONS = "https://api.example.com/poppy/conversations";
 export const CLIENT_ID = "https://agent.example/agent.json";
+export const TASKS = `${API}/poppy/tasks`;
+export const FEEDBACK = `${API}/poppy/feedback`;
+export const EXCLUDED_TASKS = `https://${DOMAIN}/poppy/excluded-tasks.json`;
+/** Where the Company serves the document for the version poppy.json doesn't carry (spec 3.4). */
+export const LINKED_DOC = `https://${DOMAIN}/poppy/other.json`;
 
 const ES256 = { name: "ECDSA", hash: "SHA-256" } as const;
 const P256 = { name: "ECDSA", namedCurve: "P-256" } as const;
 const encoder = new TextEncoder();
 
 export interface MockOptions {
+  /** The protocol version the Company serves in its poppy.json. Defaults to 0.3. */
+  version?: "0.3" | "0.4";
+  /** Also serve the other version at {@link LINKED_DOC}, listed in `supported_versions` (spec 3.4). */
+  linkOtherVersion?: boolean;
+  /** Change the linked document before it is served, to break one of spec 3.4's checks. */
+  linkedDoc?: (doc: Record<string, unknown>) => Record<string, unknown>;
+  /** Where `supported_versions` points, instead of {@link LINKED_DOC}. */
+  linkedUrl?: string;
+  /** Refuse every request with the Session header with version_unsupported, until it is cleared. */
+  versionUnsupported?: boolean;
+  /**
+   * After the first version_unsupported, serve this version instead and stop refusing, as a Company
+   * that has dropped a version does. The agent then discovers again and finds the new one (spec 3.4).
+   */
+  versionAfterError?: "0.3" | "0.4";
+  /** The body the 0.4 tasks endpoint answers with (spec section 9). */
+  tasks?: Record<string, unknown>;
   /** Token type the server issues; `DPoP` also requires a proof. */
   tokenType?: "Bearer" | "DPoP";
   /** Return a new refresh token on every refresh. */
@@ -68,6 +90,8 @@ export class MockCompany {
   readonly revoked: string[] = [];
   readonly requests: { method: string; url: string; headers: Headers; body: string }[] = [];
   readonly sessionClaims: Record<string, unknown>[] = [];
+  /** The `Poppy-Version` of each request with the Session header, in order (spec 3.4). */
+  readonly declaredVersions: (string | null)[] = [];
   readonly delegationJtis = new Set<string>();
   readonly codes = new Map<string, { challenge: string; scope: string[]; redirectUri: string }>();
   device: "pending" | "slow_down" | "approved" | "denied" = "pending";
@@ -89,9 +113,27 @@ export class MockCompany {
     return company;
   }
 
-  poppyJson(): Record<string, unknown> {
+  /** The version this Company serves, which its documents and checks follow (spec 3.4). */
+  get version(): "0.3" | "0.4" {
+    return this.options.version ?? "0.3";
+  }
+
+  get #otherVersion(): "0.3" | "0.4" {
+    return this.version === "0.3" ? "0.4" : "0.3";
+  }
+
+  /** One version's document, without the `supported_versions` only poppy.json carries. */
+  document(version: "0.3" | "0.4" = this.version): Record<string, unknown> {
+    const mediated = {
+      version: "1",
+      fields: [
+        { name: "email", label: "Email", secret: false },
+        { name: "password", label: "Password", secret: true },
+      ],
+      scopes: ["orders:read"],
+    };
     return {
-      protocol_version: "0.3",
+      protocol_version: version,
       organization: { name: "Example Company", domain: DOMAIN },
       auth: {
         scopes: { "orders:read": "See your orders", "orders:write": "Change your orders" },
@@ -106,18 +148,35 @@ export class MockCompany {
         { type: "mcp", url: MCP, description: "Search" },
         { type: "graphql", url: `${API}/graphql` },
       ],
-      extensions: {
-        operations: { version: "2" },
-        "mediated-sign-in": {
-          version: "1",
-          fields: [
-            { name: "email", label: "Email", secret: false },
-            { name: "password", label: "Password", secret: true },
-          ],
-          scopes: ["orders:read"],
-        },
-      },
+      // 0.4 moved excluded tasks, skills and feedback behind one per-Session endpoint (spec 9).
+      ...(version === "0.3"
+        ? { feedback: { endpoint: FEEDBACK }, excluded_tasks: { url: EXCLUDED_TASKS } }
+        : { tasks: { endpoint: TASKS }, web: { unscoped: true } }),
+      // 0.4 lists an entry per major version; 0.3 lists one entry (spec 3.3).
+      extensions:
+        version === "0.3"
+          ? { operations: { version: "2" }, "mediated-sign-in": mediated }
+          : {
+              operations: [{ version: "3" }, { version: "2" }],
+              "mediated-sign-in": [mediated],
+            },
     };
+  }
+
+  poppyJson(): Record<string, unknown> {
+    const document = this.document();
+    if (this.options.linkOtherVersion !== true) return document;
+    // poppy.json is this Company's preferred version, and links the other one (spec 3.4).
+    return {
+      ...document,
+      supported_versions: { [this.#otherVersion]: this.options.linkedUrl ?? LINKED_DOC },
+    };
+  }
+
+  /** The document `supported_versions` links to, for the version poppy.json doesn't carry. */
+  linkedJson(): Record<string, unknown> {
+    const document = this.document(this.#otherVersion);
+    return this.options.linkedDoc?.(document) ?? document;
   }
 
   metadata(): Record<string, unknown> {
@@ -155,6 +214,30 @@ export class MockCompany {
     switch (here) {
       case `https://${DOMAIN}/.well-known/poppy.json`:
         return json(200, this.options.poppy?.(this.poppyJson()) ?? this.poppyJson());
+      case LINKED_DOC:
+        return json(200, this.linkedJson());
+      case EXCLUDED_TASKS:
+        return json(200, { tasks: [{ task: "Send a wire transfer" }] });
+      case TASKS:
+        return this.#resource(url, method, headers, undefined, undefined, () =>
+          json(
+            200,
+            this.options.tasks ?? {
+              excluded_tasks: [{ task: "Send a wire transfer" }],
+              feedback: { endpoint: FEEDBACK },
+            },
+            { "cache-control": "private" },
+          ),
+        );
+      case FEEDBACK:
+        return this.#resource(
+          url,
+          method,
+          headers,
+          undefined,
+          undefined,
+          () => new Response(null, { status: 202 }),
+        );
       case `https://${DOMAIN}/.well-known/oauth-protected-resource`:
         return json(200, { resource: `https://${DOMAIN}`, authorization_servers: [ISSUER] });
       case `${ISSUER}/.well-known/oauth-authorization-server`:
@@ -206,8 +289,42 @@ export class MockCompany {
         });
       }
       default:
+        if (here.startsWith(CONVERSATIONS))
+          return this.#resource(url, method, headers, undefined, undefined, () =>
+            this.#conversation(url, method),
+          );
         return json(404, { error: "not_found" });
     }
+  }
+
+  /**
+   * Just enough of a conversation endpoint to see what the agent sends (spec 8). 0.3 answers with
+   * `status` and `responder`; 0.4 answers a POST with only the conversation id (spec 8.3, 8.7).
+   */
+  #conversation(url: URL, method: string): Response {
+    const rest = url.pathname
+      .slice(new URL(CONVERSATIONS).pathname.length)
+      .split("/")
+      .filter(Boolean);
+    const isV4 = this.version !== "0.3";
+    const state = isV4
+      ? { working: false, handoff: "none", responder: "agent", closed: false }
+      : { status: "idle", responder: "agent" };
+    if (method !== "POST" && !(rest[1] === "events" && method === "GET"))
+      return json(404, { error: "not_found" });
+    const id = rest[0] ?? `cnv_${++this.#counter}`;
+    if (rest[1] === "events")
+      return json(200, {
+        conversation_id: id,
+        events: [],
+        cursor: null,
+        has_more: false,
+        ...state,
+      });
+    return json(
+      rest.length === 0 ? 201 : 202,
+      isV4 ? { conversation_id: id } : { conversation_id: id, ...state },
+    );
   }
 
   async #clientOk(form: URLSearchParams): Promise<boolean> {
@@ -377,11 +494,24 @@ export class MockCompany {
     url: URL,
     method: string,
     headers: Headers,
-    scope: string,
+    scope: string | undefined,
     resource: string | undefined,
+    handler?: () => Response,
   ): Promise<Response> {
     const jwt = headers.get("poppy-session");
     if (jwt === null) return json(400, { error: "invalid_session" });
+    // From 0.4, a request with the Session header names its version (spec 3.4).
+    const declared = headers.get("poppy-version");
+    this.declaredVersions.push(declared);
+    if (this.options.versionUnsupported === true) {
+      if (this.options.versionAfterError !== undefined) {
+        this.options.version = this.options.versionAfterError;
+        this.options.versionUnsupported = false;
+      }
+      return json(400, { error: "version_unsupported" });
+    }
+    if (this.version !== "0.3" && declared !== this.version)
+      return json(400, { error: "version_unsupported" });
     const { header, payload } = decodeJwt(jwt);
     const delegation = header["poppy_dlg"];
     if (typeof delegation !== "string" || !(await verify(delegation, this.agentJwk)))
@@ -415,6 +545,8 @@ export class MockCompany {
         : `, resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource/mcp"`;
     if (authorization === null) {
       if (payload["ath"] !== undefined) return json(400, { error: "invalid_session" });
+      // An endpoint that needs no account access takes a signed-out request (spec 5, section 9).
+      if (scope === undefined) return handler?.() ?? json(200, { ok: true });
       return new Response(null, {
         status: 401,
         headers: { "www-authenticate": `Bearer scope="${scope}"${challenge}` },
@@ -440,11 +572,11 @@ export class MockCompany {
       const proof = decodeJwt(headers.get("dpop") ?? "");
       if (proof.payload["ath"] !== (await sha256(value))) return invalid();
     }
-    if (!token.scope.includes(scope))
+    if (scope !== undefined && !token.scope.includes(scope))
       return new Response(null, {
         status: 403,
         headers: { "www-authenticate": `Bearer error="insufficient_scope", scope="${scope}"` },
       });
-    return json(200, { ok: true, scope: token.scope });
+    return handler?.() ?? json(200, { ok: true, scope: token.scope });
   }
 }

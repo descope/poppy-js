@@ -22,7 +22,9 @@ type Step =
   | { action: "sign_in"; scopes: string[] }
   | { action: "sign_out" }
   | { action: "converse"; text: string }
-  | { action: "request_with_approval"; url: string; method: string; body: string };
+  | { action: "request_with_approval"; url: string; method: string; body: string }
+  | { action: "task_coverage" }
+  | { action: "report_task"; task: string; description: string };
 
 interface Context {
   steps: Step[];
@@ -96,6 +98,13 @@ async function run(step: Step): Promise<void> {
       await conversation.readAll();
       return;
     }
+    case "task_coverage":
+      // 0.3 reads the excluded tasks document; 0.4 gets all three from tasks.endpoint (spec 9).
+      await ready().session.taskCoverage();
+      return;
+    case "report_task":
+      await ready().session.sendFeedback({ task: step.task, description: step.description });
+      return;
     case "request_with_approval": {
       const { session: s } = ready();
       const init = { method: step.method, body: step.body };

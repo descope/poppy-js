@@ -1,0 +1,443 @@
+import { describe, expect, it } from "vitest";
+import {
+  companySupports,
+  MemoryStore,
+  parseEvent,
+  PoppyAgent,
+  PoppyProtocolError,
+  SUPPORTED_PROTOCOL_VERSIONS,
+  supportedScopes,
+} from "../src/index.ts";
+import { checkSignInUrl } from "../src/oauth.ts";
+import { extensionsHeader, throwable } from "../src/session.ts";
+import {
+  API,
+  CLIENT_ID,
+  CONVERSATIONS,
+  EXCLUDED_TASKS,
+  FEEDBACK,
+  LINKED_DOC,
+  MockCompany,
+  type MockOptions,
+  TASKS,
+} from "./mock-company.ts";
+
+async function setup(options: MockOptions = {}, store = new MemoryStore()) {
+  const mock = await MockCompany.create(options);
+  const agent = new PoppyAgent({
+    clientId: CLIENT_ID,
+    signingKey: { privateKey: mock.agentKey.privateKey, kid: "k1" },
+    fetch: mock.fetch,
+    store,
+    redirectUri: "https://agent.example/callback",
+    extensions: { operations: { version: "2" } },
+  });
+  const company = await agent.discover("example.com");
+  const user = await agent.user(company, "alice");
+  return { mock, agent, company, user, session: user.session() };
+}
+
+describe("choosing a protocol version (spec 3.4)", () => {
+  it("implements 0.4 and 0.3, newest first", () => {
+    expect(SUPPORTED_PROTOCOL_VERSIONS).toEqual(["0.4", "0.3"]);
+  });
+
+  it("uses poppy.json when the Company prefers a version this client implements", async () => {
+    const { company } = await setup({ version: "0.4" });
+    expect(company.protocolVersion).toBe("0.4");
+    expect(company.supportedVersions).toEqual({});
+    expect(company.documentUrl).toBe("https://example.com/.well-known/poppy.json");
+    expect(company.tasksEndpoint).toBe(TASKS);
+    // 0.4 moved these out of poppy.json, so they're only in the tasks response.
+    expect(company.feedbackEndpoint).toBeUndefined();
+    expect(company.excludedTasksUrl).toBeUndefined();
+    expect(company.webUnscoped).toBe(true);
+  });
+
+  it("follows supported_versions to the newest version's document", async () => {
+    // poppy.json is 0.3 and links 0.4, so the agent has to fetch the linked document and use it.
+    const { company, mock } = await setup({ version: "0.3", linkOtherVersion: true });
+    expect(company.protocolVersion).toBe("0.4");
+    expect(company.documentUrl).toBe(LINKED_DOC);
+    expect(company.supportedVersions).toEqual({ "0.4": LINKED_DOC });
+    expect(company.tasksEndpoint).toBe(TASKS);
+    expect(mock.requests.some((r) => r.url === LINKED_DOC)).toBe(true);
+  });
+
+  it("stays on poppy.json when it already carries the newest version", async () => {
+    // poppy.json is 0.4 and links 0.3, which is older, so there's nothing to fetch.
+    const { company, mock } = await setup({ version: "0.4", linkOtherVersion: true });
+    expect(company.protocolVersion).toBe("0.4");
+    expect(mock.requests.some((r) => r.url === LINKED_DOC)).toBe(false);
+  });
+
+  it("ignores a supported_versions entry on another host, and keeps poppy.json's version", async () => {
+    const { company, mock } = await setup({
+      version: "0.3",
+      linkOtherVersion: true,
+      linkedUrl: "https://elsewhere.test/poppy/0.4.json",
+    });
+    expect(company.protocolVersion).toBe("0.3");
+    expect(company.supportedVersions).toEqual({});
+    expect(mock.requests.some((r) => r.url.includes("elsewhere.test"))).toBe(false);
+  });
+
+  it("refuses a linked document that declares another version, and falls back", async () => {
+    const { company } = await setup({
+      version: "0.3",
+      linkOtherVersion: true,
+      linkedDoc: (doc) => ({ ...doc, protocol_version: "0.3" }),
+    });
+    // The document listed under 0.4 isn't a 0.4 document, so 0.4 drops out and 0.3 is used.
+    expect(company.protocolVersion).toBe("0.3");
+  });
+
+  it("refuses a linked document that carries supported_versions of its own", async () => {
+    const { company } = await setup({
+      version: "0.3",
+      linkOtherVersion: true,
+      linkedDoc: (doc) => ({ ...doc, supported_versions: { "0.2": LINKED_DOC } }),
+    });
+    expect(company.protocolVersion).toBe("0.3");
+  });
+
+  it("refuses a Company that serves no version it implements", async () => {
+    const mock = await MockCompany.create({
+      poppy: (doc) => ({
+        ...doc,
+        protocol_version: "9.9",
+        supported_versions: { "0.1": LINKED_DOC },
+      }),
+    });
+    const agent = new PoppyAgent({
+      clientId: CLIENT_ID,
+      signingKey: { privateKey: mock.agentKey.privateKey, kid: "k1" },
+      fetch: mock.fetch,
+    });
+    await expect(agent.discover("example.com")).rejects.toThrow(PoppyProtocolError);
+  });
+});
+
+describe("version and extension headers (spec 3.4)", () => {
+  it("sends Poppy-Version and Poppy-Extensions on 0.4, and neither on 0.3", async () => {
+    const v4 = await setup({ version: "0.4" });
+    await (await v4.session.fetch(`${API}/v1/orders`)).body?.cancel();
+    const request = v4.mock.requests.find((r) => r.url === `${API}/v1/orders`);
+    expect(request?.headers.get("poppy-version")).toBe("0.4");
+    expect(request?.headers.get("poppy-extensions")).toBe('"operations";v="2"');
+
+    const v3 = await setup({ version: "0.3" });
+    await (await v3.session.fetch(`${API}/v1/orders`)).body?.cancel();
+    const older = v3.mock.requests.find((r) => r.url === `${API}/v1/orders`);
+    expect(older?.headers.get("poppy-version")).toBeNull();
+    expect(older?.headers.get("poppy-extensions")).toBeNull();
+  });
+
+  it("declares only extensions both sides list, at the version the agent uses", async () => {
+    const { company } = await setup({ version: "0.4" });
+    // The Company lists operations 3 and 2; this agent uses 2, so that is what it declares.
+    expect(companySupports(company, "operations", "3")).toBe(true);
+    expect(companySupports(company, "operations", "2")).toBe(true);
+    expect(extensionsHeader(company, { operations: { version: "2" } })).toBe('"operations";v="2"');
+    // An extension the Company doesn't list isn't declared, and nor is a version it doesn't list.
+    expect(extensionsHeader(company, { operations: { version: "9" } })).toBeUndefined();
+    expect(extensionsHeader(company, { "other.test/gift": { version: "1" } })).toBeUndefined();
+    expect(
+      extensionsHeader(company, {
+        operations: { version: "2" },
+        "mediated-sign-in": { version: "1" },
+      }),
+    ).toBe('"operations";v="2", "mediated-sign-in";v="1"');
+  });
+
+  it("discovers again on version_unsupported, and gives up when the version is the same", async () => {
+    const { session, mock } = await setup({ version: "0.4", versionUnsupported: true });
+    const response = await session.fetch(`${API}/v1/orders`);
+    await response.body?.cancel();
+    expect(response.status).toBe(400);
+    // One retry's worth of discovery, then it stops rather than looping (spec 3.4).
+    const discoveries = mock.requests.filter((r) =>
+      r.url.endsWith("/.well-known/poppy.json"),
+    ).length;
+    expect(discoveries).toBe(2);
+    expect(mock.requests.filter((r) => r.url === `${API}/v1/orders`)).toHaveLength(1);
+  });
+
+  it("continues in a new Session at the version a fresh discovery chooses", async () => {
+    // The Company stops serving 0.4 between the refusal and the fresh discovery.
+    const { session, mock } = await setup({
+      version: "0.4",
+      versionUnsupported: true,
+      versionAfterError: "0.3",
+    });
+    const first = session.id;
+    const response = await session.fetch(`${API}/v1/orders`);
+    await response.body?.cancel();
+    // The retry got through: 401 is the Company asking this signed-out Session to sign in, not a
+    // version error.
+    expect(response.status).toBe(401);
+    expect(session.protocolVersion).toBe("0.3");
+    expect(session.company.protocolVersion).toBe("0.3");
+    // A new version means a new Session, since the old one's state doesn't carry over.
+    expect(session.id).not.toBe(first);
+    expect(mock.declaredVersions).toEqual(["0.4", null]);
+  });
+});
+
+describe("task coverage (spec section 9)", () => {
+  it("reads 0.3's excluded tasks document, and 0.4's per-Session tasks endpoint", async () => {
+    const older = await setup({ version: "0.3" });
+    const v3 = await older.session.taskCoverage();
+    expect(v3.excludedTasks).toEqual([{ task: "Send a wire transfer", alternative: undefined }]);
+    expect(v3.feedbackEndpoint).toBe(FEEDBACK);
+    const document = older.mock.requests.find((r) => r.url === EXCLUDED_TASKS);
+    // The 0.3 document is the same for every User, so it carries no Session header (spec 9.1).
+    expect(document?.headers.get("poppy-session")).toBeNull();
+
+    const { session, mock } = await setup({ version: "0.4" });
+    const v4 = await session.taskCoverage();
+    expect(v4.excludedTasks).toEqual([{ task: "Send a wire transfer", alternative: undefined }]);
+    expect(v4.feedbackEndpoint).toBe(FEEDBACK);
+    const tasks = mock.requests.find((r) => r.url === TASKS);
+    expect(tasks?.method).toBe("GET");
+    expect(tasks?.headers.get("poppy-session")).not.toBeNull();
+    // The response describes what the Company offers, not the account, so it carries no token.
+    expect(tasks?.headers.get("authorization")).toBeNull();
+  });
+
+  it("keeps a Session's tasks response for that Session only", async () => {
+    const { user, mock } = await setup({ version: "0.4" });
+    const first = user.session();
+    await first.taskCoverage();
+    await first.taskCoverage();
+    expect(mock.requests.filter((r) => r.url === TASKS)).toHaveLength(1);
+    // A second Session asks again, since the answer belongs to the Session it was given to.
+    await user.session().taskCoverage();
+    expect(mock.requests.filter((r) => r.url === TASKS)).toHaveLength(2);
+  });
+
+  it("reads skills from the tasks response, resolved against tasks.endpoint", async () => {
+    const { session } = await setup({
+      version: "0.4",
+      tasks: {
+        skill_index: {
+          $schema: "https://schemas.agentskills.io/discovery/0.2.0/schema.json",
+          skills: [
+            {
+              name: "manage-bookings",
+              description: "Manage bookings.",
+              type: "skill-md",
+              url: "skills/manage-bookings/SKILL.md",
+              digest: `sha256:${"1".repeat(64)}`,
+            },
+          ],
+        },
+      },
+    });
+    const { skills, feedbackEndpoint } = await session.taskCoverage();
+    expect(skills[0]?.url).toBe(`${API}/poppy/skills/manage-bookings/SKILL.md`);
+    expect(feedbackEndpoint).toBeUndefined();
+  });
+
+  it("carries on with empty coverage when the tasks endpoint answers with nothing usable", async () => {
+    const { session } = await setup({ version: "0.4", tasks: { excluded_tasks: "not a list" } });
+    await expect(session.taskCoverage()).resolves.toEqual({
+      excludedTasks: [],
+      skills: [],
+      feedbackEndpoint: undefined,
+    });
+  });
+
+  it("sends feedback to the endpoint the tasks response names, with no access token", async () => {
+    const { session, mock } = await setup({ version: "0.4" });
+    await expect(
+      session.sendFeedback({ task: "Pay with a gift card", description: "No API offered one." }),
+    ).resolves.toBeUndefined();
+    const report = mock.requests.find((r) => r.url === FEEDBACK);
+    expect(report?.method).toBe("POST");
+    expect(report?.headers.get("poppy-session")).not.toBeNull();
+    expect(report?.headers.get("authorization")).toBeNull();
+  });
+});
+
+describe("conversation state and request IDs (spec 8.3, 8.7)", () => {
+  it("reads 0.3's status and 0.4's four fields into the same state", () => {
+    const base = { id: "evt_1", created_at: "2026-11-10T00:00:00Z", type: "state" };
+    // 0.3 carries one status at a time, which says everything.
+    expect(parseEvent({ ...base, status: "queued", responder: "agent" })).toMatchObject({
+      status: "queued",
+      working: false,
+      handoff: "pending",
+      closed: false,
+      responder: "agent",
+    });
+    expect(parseEvent({ ...base, status: "working", responder: "agent" })).toMatchObject({
+      working: true,
+      handoff: "none",
+    });
+    // 0.4 carries handoff, responder and closed, and says nothing about working.
+    expect(
+      parseEvent({ ...base, handoff: "pending", responder: "agent", closed: false }),
+    ).toMatchObject({ status: "queued", working: undefined, handoff: "pending", closed: false });
+    expect(
+      parseEvent({ ...base, handoff: "none", responder: "human", closed: true }),
+    ).toMatchObject({ status: "closed", closed: true, responder: "human" });
+    // An unrecognized handoff reads as pending, the more cautious answer (spec 8.7).
+    expect(parseEvent({ ...base, handoff: "looking", responder: "agent" })).toMatchObject({
+      handoff: "pending",
+    });
+  });
+
+  it("reads as_of_request and as_of_cursor, and a message id the Company set", () => {
+    const event = parseEvent({
+      id: "evt_2",
+      created_at: "2026-11-10T00:00:00Z",
+      type: "message",
+      message: {
+        id: "msg_1",
+        role: "company",
+        author: { type: "agent" },
+        as_of_request: "msg_a",
+        text: "Done",
+      },
+    });
+    expect(event).toMatchObject({
+      type: "message",
+      message: { id: "msg_1", asOfRequest: "msg_a", asOfCursor: undefined },
+    });
+  });
+
+  it("puts the request id on the body from 0.4, and on the message on 0.3", async () => {
+    for (const version of ["0.3", "0.4"] as const) {
+      const { session, mock } = await setup({ version });
+      const { conversation } = await session
+        .conversations()
+        .start({ id: "req_1", text: "Hello", asOfCursor: "evt_c1" });
+      const start = mock.requests.find((r) => r.url === CONVERSATIONS);
+      const body = JSON.parse(start?.body ?? "{}") as Record<string, Record<string, unknown>>;
+      if (version === "0.3") {
+        expect(body["id"]).toBeUndefined();
+        expect(body["message"]).toMatchObject({ id: "req_1", text: "Hello" });
+        // as_of_cursor is 0.4 only, so a 0.3 Company never sees it (spec 8.4).
+        expect(body["message"]?.["as_of_cursor"]).toBeUndefined();
+      } else {
+        expect(body["id"]).toBe("req_1");
+        expect(body["message"]?.["id"]).toBeUndefined();
+        expect(body["message"]?.["as_of_cursor"]).toBe("evt_c1");
+      }
+      // Handoff and close carry a request id from 0.4, and an empty object on 0.3 (spec 8.9, 8.12).
+      await conversation.handoff({ id: "hnd_1" });
+      const handoff = mock.requests.find((r) => r.url.endsWith("/handoff"));
+      expect(JSON.parse(handoff?.body ?? "{}")).toEqual(version === "0.3" ? {} : { id: "hnd_1" });
+      // Withdrawing a handoff is 0.4 only (spec 8.9).
+      if (version === "0.3")
+        await expect(conversation.cancelHandoff()).rejects.toThrow(PoppyProtocolError);
+      else {
+        await conversation.cancelHandoff({ id: "hnc_1" });
+        const cancel = mock.requests.find((r) => r.url.endsWith("/handoff/cancel"));
+        expect(JSON.parse(cancel?.body ?? "{}")).toEqual({ id: "hnc_1" });
+      }
+    }
+  });
+
+  it("doesn't put as_of_cursor on a message a person wrote", async () => {
+    const { session, mock } = await setup({ version: "0.4" });
+    await session
+      .conversations()
+      .openDirect("cnv_1", { text: "Hi", author: { type: "human" }, asOfCursor: "evt_c1" });
+    const body = JSON.parse(
+      mock.requests.find((r) => r.url === CONVERSATIONS)?.body ?? "{}",
+    ) as Record<string, Record<string, unknown>>;
+    expect(body["message"]?.["as_of_cursor"]).toBeUndefined();
+  });
+});
+
+describe("errors and links (spec 3.3, 4.3, 4.5, 8.13)", () => {
+  it("reads extension_required from a JSON body at an API, as 0.4 sends it", async () => {
+    const response = Response.json(
+      { error: "extension_required", extension: "operations" },
+      {
+        status: 403,
+      },
+    );
+    const error = await throwable(response);
+    expect(error).toMatchObject({ error: "extension_required", extension: "operations" });
+  });
+
+  it("still reads insufficient_scope from the challenge, which both versions send there", async () => {
+    const response = new Response(null, {
+      status: 403,
+      headers: { "www-authenticate": 'Bearer error="insufficient_scope", scope="orders:write"' },
+    });
+    const error = await throwable(response);
+    expect(error).toMatchObject({ error: "insufficient_scope", scope: "orders:write" });
+  });
+
+  it("keeps protocol_version from version_mismatch", async () => {
+    const error = await throwable(
+      Response.json({ error: "version_mismatch", protocol_version: "0.4" }, { status: 409 }),
+    );
+    expect(error).toMatchObject({ error: "version_mismatch", protocolVersion: "0.4" });
+  });
+
+  it("narrows the Device Sign-In link rule on 0.4 (spec 4.3)", async () => {
+    // The issuer serves another domain of the Company's too, as a shared issuer often does.
+    const withSibling = (company: Awaited<ReturnType<typeof setup>>["company"]) => ({
+      ...company,
+      oauth: {
+        ...company.oauth!,
+        protectedResources: ["https://example.com", "https://example.co.uk"],
+      },
+    });
+    const older = withSibling((await setup({ version: "0.3" })).company);
+    const newer = withSibling((await setup({ version: "0.4" })).company);
+    // Both versions allow the issuer's host, a subdomain of it, and organization.domain.
+    for (const company of [older, newer]) {
+      expect(checkSignInUrl(company, "https://auth.example.com/activate", "link")).toBe(
+        "https://auth.example.com/activate",
+      );
+      expect(checkSignInUrl(company, "https://shop.example.com/activate", "link")).toBe(
+        "https://shop.example.com/activate",
+      );
+    }
+    // 0.3 also allows the host of any URL in protected_resources.
+    expect(checkSignInUrl(older, "https://example.co.uk/activate", "link")).toBe(
+      "https://example.co.uk/activate",
+    );
+    // 0.4 doesn't: that list can name domains that only share the issuer, so a link there could pass
+    // off a page the Company doesn't control as its sign-in page (spec 4.3).
+    expect(() => checkSignInUrl(newer, "https://example.co.uk/activate", "link")).toThrow(
+      PoppyProtocolError,
+    );
+  });
+});
+
+describe("scopes (spec 3.2, 4.7)", () => {
+  it("takes the scopes the issuer and the domain's resource metadata list", async () => {
+    const mock = await MockCompany.create({ version: "0.4" });
+    const agent = new PoppyAgent({
+      clientId: CLIENT_ID,
+      signingKey: { privateKey: mock.agentKey.privateKey, kid: "k1" },
+      fetch: ((input: string | URL | Request, init?: RequestInit) => {
+        const url = String(input instanceof Request ? input.url : input);
+        if (url === "https://example.com/.well-known/oauth-protected-resource")
+          return Promise.resolve(
+            Response.json({
+              resource: "https://example.com",
+              authorization_servers: ["https://auth.example.com"],
+              scopes_supported: ["poppy:browser-sign-in", "orders:read"],
+            }),
+          );
+        return mock.fetch(input, init);
+      }) as typeof fetch,
+    });
+    const company = await agent.discover("example.com");
+    expect(company.resourceScopesSupported).toEqual(["poppy:browser-sign-in", "orders:read"]);
+    // Either list may name a scope the agent can request, so it uses both (spec 4.7).
+    expect(supportedScopes(company).sort()).toEqual([
+      "orders:read",
+      "orders:write",
+      "poppy:browser-sign-in",
+    ]);
+  });
+});

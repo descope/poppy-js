@@ -7,7 +7,7 @@ The SDK is tested two ways.
 `test/interop/` runs the SDK against `fake-company.ts` from the
 [spec repository](https://github.com/personal-agent-protocol/personal-agent-protocol), vendored in
 `test/interop/kit/`. It is the in-memory Company the spec's own validator tests itself with, so it
-checks the SDK against the spec authors' reading of draft 0.3:
+checks the SDK against the spec authors' reading of 0.3:
 
 - discovery, including the www redirect, redirects to uploads or to `http`, a mismatched domain,
   several issuers, a trailing slash on `resource`, and a Company with no issuer;

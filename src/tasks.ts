@@ -1,6 +1,6 @@
-import type { Company } from "./discovery.ts";
+import { type Company, parseSkillIndex, type Skill } from "./discovery.ts";
 import { PoppyProtocolError } from "./errors.ts";
-import { isObject } from "./http.ts";
+import { httpsUrl, isObject } from "./http.ts";
 
 /** Where to do a task (spec 9.2). References of unknown types are skipped. */
 export type Reference =
@@ -18,6 +18,23 @@ export interface Alternative {
 export interface ExcludedTask {
   task: string;
   alternative: Alternative | undefined;
+}
+
+/**
+ * What the Company offers a Session, in one place (spec section 9): the tasks it chose not to offer, the
+ * skills it publishes, and where to send feedback. Get it from `Session.taskCoverage()`.
+ *
+ * On 0.3 these are three fields of `poppy.json`, the same for every User. On 0.4 they come from one
+ * `tasks.endpoint`, fetched per Session, so a Company can answer different Sessions differently; the
+ * answer belongs to that Session and MUST NOT be used in another.
+ */
+export interface TaskCoverage {
+  /** Tasks the Company doesn't offer through this protocol (spec 9.1). Empty when it lists none. */
+  excludedTasks: readonly ExcludedTask[];
+  /** Skills the Company publishes (spec 9.4). Empty when it publishes none. */
+  skills: readonly Skill[];
+  /** Where to report a task that couldn't be done (spec 9.3), or undefined when it takes no feedback. */
+  feedbackEndpoint: string | undefined;
 }
 
 /** A report of a task the User couldn't do (spec 9.3). */
@@ -66,13 +83,41 @@ export function parseAlternative(value: unknown, company: Company): Alternative 
   return { instructions, references };
 }
 
-export function parseExcludedTasks(body: unknown, company: Company): ExcludedTask[] {
-  if (!isObject(body) || !Array.isArray(body["tasks"]))
-    throw new PoppyProtocolError("excluded tasks must have a tasks list");
-  return body["tasks"].flatMap((entry): ExcludedTask[] => {
+function parseTaskList(value: unknown, company: Company): ExcludedTask[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((entry): ExcludedTask[] => {
     if (!isObject(entry) || typeof entry["task"] !== "string") return [];
     return [{ task: entry["task"], alternative: parseAlternative(entry["alternative"], company) }];
   });
+}
+
+/** Reads the 0.3 excluded tasks document, which lists them under `tasks` (spec 9.1). */
+export function parseExcludedTasks(body: unknown, company: Company): ExcludedTask[] {
+  if (!isObject(body) || !Array.isArray(body["tasks"]))
+    throw new PoppyProtocolError("excluded tasks must have a tasks list");
+  return parseTaskList(body["tasks"], company);
+}
+
+/**
+ * Reads the 0.4 response from `tasks.endpoint` (spec section 9). Every field is optional, so a Company
+ * that offers none of the three answers with an empty object. Skill URLs resolve against
+ * `tasks.endpoint`, which is the document they came in (spec 9.4).
+ */
+export function parseTaskCoverage(
+  body: unknown,
+  company: Company,
+  tasksEndpoint: string,
+): TaskCoverage {
+  if (!isObject(body)) throw new PoppyProtocolError("the tasks response must be an object");
+  const feedback = body["feedback"];
+  return {
+    excludedTasks: parseTaskList(body["excluded_tasks"], company),
+    skills: parseSkillIndex(body["skill_index"], new URL(tasksEndpoint)),
+    feedbackEndpoint:
+      isObject(feedback) && feedback["endpoint"] !== undefined
+        ? httpsUrl(feedback["endpoint"], "feedback.endpoint").href
+        : undefined,
+  };
 }
 
 export function checkFeedback(report: FeedbackReport): void {

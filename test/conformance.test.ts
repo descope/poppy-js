@@ -75,6 +75,12 @@ function sdkFactory(privateKey: CryptoKey): AgentFactory {
         await conversation.send({ text: "Thanks" });
         await conversation.readAll();
       },
+      async taskCoverage() {
+        await ready().session.taskCoverage();
+      },
+      async reportTask(report) {
+        await ready().session.sendFeedback(report);
+      },
       async requestWithApproval(url, init) {
         const { session: s } = ready();
         const refused = await s.fetch(url, init);
@@ -127,7 +133,7 @@ describe("conformance suite", () => {
       "conversation.messages": "skip",
     });
     expect(formatReport(report)).toMatch(
-      /^Personal Agent Protocol 0\.3 conformance: \d+ passed, \d+ failed, \d+ skipped/,
+      /^Personal Agent Protocol 0\.4 and 0\.3 conformance: \d+ passed, \d+ failed, \d+ skipped/,
     );
   });
 });

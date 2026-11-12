@@ -9,9 +9,11 @@ export type {
   Author,
   ConversationEvent,
   ConversationMessage,
+  ConversationState,
   ConversationStatus,
   ConversationUpdate,
   Disclosure,
+  Handoff,
   MessageContext,
   MessageLink,
   OutgoingMessage,
@@ -19,12 +21,15 @@ export type {
   StreamItem,
 } from "./conversations.ts";
 export {
+  BROWSER_SIGN_IN_SCOPE,
+  companyExtension,
   companySupports,
   discover,
   DEVICE_CODE_GRANT,
   MEDIATED_SIGN_IN_GRANT,
   SKILL_INDEX_SCHEMA,
   SUPPORTED_PROTOCOL_VERSIONS,
+  supportedScopes,
 } from "./discovery.ts";
 export type {
   Api,
@@ -61,13 +66,19 @@ export type { Approval, Operation } from "./operations.ts";
 export { operatorKeyId } from "./operator.ts";
 export type { OperatorSignatureOptions } from "./operator.ts";
 export { Session } from "./session.ts";
-export type { BrowserJoiner, SessionFetchInit } from "./session.ts";
+export type { BrowserJoiner, Rediscovered, SessionFetchInit } from "./session.ts";
 export { MAX_DELEGATION_LIFETIME } from "./session-jwt.ts";
-export { fetchSkill } from "./skills.ts";
+export { fetchSkill, fetchSkillArtifact } from "./skills.ts";
 export type { FetchSkillOptions, SkillArtifact } from "./skills.ts";
 export { MemoryStore } from "./store.ts";
 export type { Store } from "./store.ts";
-export type { Alternative, ExcludedTask, FeedbackReport, Reference } from "./tasks.ts";
+export type {
+  Alternative,
+  ExcludedTask,
+  FeedbackReport,
+  Reference,
+  TaskCoverage,
+} from "./tasks.ts";
 export {
   poppyTools,
   runTool,

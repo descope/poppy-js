@@ -127,6 +127,11 @@ export class Account {
     await this.#init.store.set(this.#init.storeKey, JSON.stringify(state));
   }
 
+  /**
+   * The account's DPoP key (spec 4.5), generated once and kept in the store. Each Account belongs to one
+   * of the agent's Users at one Company identifier, and so to one User ID, so a key never signs for two
+   * Users and Companies can't match a User by its thumbprint, as 0.4 requires of delegated keys too.
+   */
   async #dpopKey(): Promise<DpopKey> {
     if (this.#dpop !== undefined) return this.#dpop;
     if (this.#state.dpopKey !== undefined) {
@@ -375,11 +380,11 @@ export class Account {
         organizationName: company.name,
         domain: company.domain,
         userCode: user_code,
-        verificationUri: checkSignInUrl(oauth, verification_uri, "verification_uri"),
+        verificationUri: checkSignInUrl(company, verification_uri, "verification_uri"),
         verificationUriComplete:
           verification_uri_complete === undefined
             ? undefined
-            : checkSignInUrl(oauth, verification_uri_complete, "verification_uri_complete"),
+            : checkSignInUrl(company, verification_uri_complete, "verification_uri_complete"),
         expiresIn: expires_in,
         interval: typeof interval === "number" && interval > 0 ? interval : 5,
       },

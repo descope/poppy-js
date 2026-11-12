@@ -1,4 +1,4 @@
-import { PoppyProtocolError } from "./errors.ts";
+import { PoppyError, PoppyProtocolError } from "./errors.ts";
 import {
   authorizationServerMetadataUrl,
   checkPublicHost,
@@ -10,8 +10,19 @@ import {
   resourceMetadataUrl,
 } from "./http.ts";
 
-/** The `major.minor` versions of `poppy.json` this client follows (spec 3.1). */
-export const SUPPORTED_PROTOCOL_VERSIONS: readonly string[] = ["0.3"];
+/**
+ * The `major.minor` versions this client implements, newest first (spec 3.1, 3.4). A Company serves one
+ * version in `poppy.json` and may list others in `supported_versions`; {@link discover} picks the newest
+ * of them this list names and uses that version's document.
+ */
+export const SUPPORTED_PROTOCOL_VERSIONS: readonly string[] = ["0.4", "0.3"];
+
+/**
+ * The only scope the protocol defines (spec 4.7, section 6), from 0.4: it signs the agent's browser in to
+ * the Company's website in a browser join. Request it only from a Company that lists
+ * `browser_session_endpoint`, and read {@link Company.webUnscoped} first to see what it allows there.
+ */
+export const BROWSER_SIGN_IN_SCOPE = "poppy:browser-sign-in";
 
 export const DEVICE_CODE_GRANT = "urn:ietf:params:oauth:grant-type:device_code";
 export const MEDIATED_SIGN_IN_GRANT = "https://personalagentprotocol.org/grant/mediated-sign-in";
@@ -67,7 +78,12 @@ export interface OAuthServer {
   tokenEndpointAuthSigningAlgValuesSupported: readonly string[] | undefined;
 }
 
-/** One skill from `skill_index` (spec 9.4). Content from the Company: it grants nothing. */
+/**
+ * One skill from a `skill_index` (spec 9.4). Content from the Company: it grants nothing.
+ *
+ * On 0.3 the index is in `poppy.json` and {@link Company.skills} holds it. On 0.4 it is in the response
+ * from `tasks.endpoint`, so it belongs to one Session; read it with `Session.taskCoverage()`.
+ */
 export interface Skill {
   name: string;
   description: string;
@@ -98,7 +114,16 @@ export interface ExtensionEntry {
 
 /** A Company's `poppy.json` and OAuth metadata, after every check in spec section 3. */
 export interface Company {
+  /**
+   * The version negotiated with this Company (spec 3.4): the newest of the versions it serves that
+   * {@link SUPPORTED_PROTOCOL_VERSIONS} names. Everything else here, and the requests this SDK sends,
+   * follow it, so keep the Company you discovered rather than mixing documents.
+   */
   protocolVersion: string;
+  /** The URL the chosen version's document was read from, which skill and index URLs resolve against. */
+  documentUrl: string;
+  /** The other versions the Company serves, each mapped to its document's URL (spec 3.4). */
+  supportedVersions: Readonly<Record<string, string>>;
   /** The host that served `poppy.json`, after redirects; equals `organization.domain`, lowercased. */
   domain: string;
   name: string;
@@ -125,13 +150,47 @@ export interface Company {
   /** Scope descriptions from `auth.scopes` (spec 4.7). */
   scopes: Readonly<Record<string, string>>;
   scopeHints: Readonly<Record<string, ScopeHint>>;
+  /**
+   * Scopes from `scopes_supported` in the domain's protected resource metadata (RFC 9728 section 2,
+   * spec 3.2, 4.7). A Personal Agent can request the scopes in this list or the issuer's.
+   */
+  resourceScopesSupported: readonly string[] | undefined;
   conversationProtocols: readonly ConversationProtocol[];
   apis: readonly Api[];
   browserSessionEndpoint: string | undefined;
+  /**
+   * `web.disabled` (spec 3.1, section 6), from 0.4: the Company asks Personal Agents not to browse its
+   * website in a browser, and to use its Company Agent and APIs instead. Pages fetched without a browser
+   * aren't covered. Always false on 0.3.
+   */
+  webDisabled: boolean;
+  /**
+   * `web.unscoped` (spec 3.1, section 6), from 0.4: the website doesn't apply the Company's other scopes,
+   * so {@link BROWSER_SIGN_IN_SCOPE} gives the account's full access there. Always false on 0.3.
+   */
+  webUnscoped: boolean;
+  /**
+   * `feedback.endpoint` (spec 9.3). Set only on 0.3, where it is in `poppy.json`; on 0.4 it comes from
+   * `tasks.endpoint` for each Session, so read it with `Session.taskCoverage()`.
+   */
   feedbackEndpoint: string | undefined;
+  /** `excluded_tasks.url` (spec 9.1). Set only on 0.3; on 0.4 excluded tasks come from `tasksEndpoint`. */
   excludedTasksUrl: string | undefined;
-  extensions: Readonly<Record<string, ExtensionEntry>>;
-  /** Skills from `skill_index` (spec 9.4), or empty when it's absent or its `$schema` is unknown. */
+  /**
+   * `tasks.endpoint` (spec section 9), from 0.4: where a Session gets the Company's excluded tasks,
+   * skills and feedback endpoint. Undefined on 0.3.
+   */
+  tasksEndpoint: string | undefined;
+  /**
+   * The extensions the Company lists, keyed by name (spec 3.3). Each name has one entry per major
+   * version it supports, newest first as published. A 0.3 document lists one entry per extension, which
+   * is read as a list of one, so the same code reads both versions.
+   */
+  extensions: Readonly<Record<string, readonly ExtensionEntry[]>>;
+  /**
+   * Skills from `skill_index` in `poppy.json` (spec 9.4). Set only on 0.3; on 0.4 the index comes from
+   * `tasks.endpoint` for each Session, so read it with `Session.taskCoverage()`.
+   */
   skills: readonly Skill[];
   /** Set when the Company lists the UCP extension, version 1. */
   ucp: UcpExtensionInfo | undefined;
@@ -155,6 +214,85 @@ function optionalStringList(value: unknown, what: string): string[] | undefined 
     throw new PoppyProtocolError(`${what} must be a list of strings`);
   }
   return value;
+}
+
+const VERSION = /^(\d+)\.(\d+)$/;
+
+/**
+ * Orders `major.minor` versions. Returns undefined for anything that isn't one, which is never chosen.
+ */
+function versionOrder(version: string): number | undefined {
+  const match = VERSION.exec(version);
+  if (match === null) return undefined;
+  return Number(match[1]) * 100_000 + Number(match[2]);
+}
+
+/**
+ * Reads `supported_versions` (spec 3.4): the other versions the Company serves, each mapped to the URL of
+ * that version's document. Each URL MUST be HTTPS on the host that served `poppy.json` after redirects,
+ * so one domain's document can't make a file uploaded to another speak for that Company. An entry that
+ * isn't a `major.minor` version, or whose URL fails a check, is dropped rather than failing discovery,
+ * since the Company's own version still works.
+ */
+function parseSupportedVersions(value: unknown, finalUrl: URL): Record<string, string> {
+  if (!isObject(value)) return {};
+  const host = finalUrl.hostname.toLowerCase();
+  const versions: Record<string, string> = {};
+  for (const [version, url] of Object.entries(value)) {
+    if (versionOrder(version) === undefined || typeof url !== "string") continue;
+    let parsed: URL;
+    try {
+      parsed = new URL(url, finalUrl);
+    } catch {
+      continue;
+    }
+    if (parsed.protocol !== "https:") continue;
+    if (parsed.hostname.toLowerCase() !== host) continue;
+    versions[version] = parsed.href;
+  }
+  return versions;
+}
+
+/**
+ * Picks the newest version the Company serves that this client implements (spec 3.4). Two versions are
+ * compatible when they have the same major version and, before 1.0, the same minor version, so a version
+ * this client implements is simply one of {@link SUPPORTED_PROTOCOL_VERSIONS}.
+ */
+function choosableVersions(
+  documentVersion: string,
+  supportedVersions: Readonly<Record<string, string>>,
+): string[] {
+  return [documentVersion, ...Object.keys(supportedVersions)]
+    .filter((version) => SUPPORTED_PROTOCOL_VERSIONS.includes(version))
+    .map((version) => ({ version, order: versionOrder(version) }))
+    .filter((entry): entry is { version: string; order: number } => entry.order !== undefined)
+    .sort((a, b) => b.order - a.order)
+    .map((entry) => entry.version);
+}
+
+/**
+ * Fetches the document a `supported_versions` entry links to (spec 3.4). It is never followed through a
+ * redirect, carries the `protocol_version` it was listed under, and has no `supported_versions` of its
+ * own, so a chain of links can't take the agent somewhere else.
+ */
+async function fetchLinkedDocument(
+  fetchFn: Fetch,
+  url: string,
+  version: string,
+  allowPrivate: boolean,
+): Promise<Record<string, unknown>> {
+  const { body } = await getJson(fetchFn, new URL(url), `the ${version} document`, {
+    allowPrivate,
+    followRedirects: false,
+  });
+  if (!isObject(body)) throw new PoppyProtocolError(`the ${version} document must be an object`);
+  if (body["protocol_version"] !== version)
+    throw new PoppyProtocolError(
+      `the document listed under ${version} declares protocol_version ${String(body["protocol_version"])}`,
+    );
+  if (body["supported_versions"] !== undefined)
+    throw new PoppyProtocolError(`the ${version} document must not have supported_versions`);
+  return body;
 }
 
 function websiteUrl(website: string): URL {
@@ -221,14 +359,31 @@ function parseScopeHints(value: unknown): Record<string, ScopeHint> {
   return hints;
 }
 
-function parseExtensions(value: unknown): Record<string, ExtensionEntry> {
+/**
+ * Reads `extensions` (spec 3.3). On 0.4 each name maps to a list with an entry for each major version
+ * the Company supports; on 0.3 it maps to one entry, which is read as a list of one. Entries of an
+ * unknown shape are skipped, since either side works without an extension it doesn't support.
+ */
+function parseExtensions(value: unknown, version: string): Record<string, ExtensionEntry[]> {
   if (!isObject(value)) return {};
-  const extensions: Record<string, ExtensionEntry> = {};
-  for (const [name, entry] of Object.entries(value)) {
-    if (isObject(entry) && typeof entry["version"] === "string")
-      extensions[name] = entry as ExtensionEntry;
+  const extensions: Record<string, ExtensionEntry[]> = {};
+  for (const [name, listed] of Object.entries(value)) {
+    const entries = (version === "0.3" ? [listed] : Array.isArray(listed) ? listed : []).flatMap(
+      (entry): ExtensionEntry[] =>
+        isObject(entry) && typeof entry["version"] === "string" ? [entry as ExtensionEntry] : [],
+    );
+    if (entries.length > 0) extensions[name] = entries;
   }
   return extensions;
+}
+
+/** The Company's entry for `name` at `version`, or undefined when it doesn't list that version. */
+function extensionEntry(
+  extensions: Readonly<Record<string, readonly ExtensionEntry[]>>,
+  name: string,
+  version: string,
+): ExtensionEntry | undefined {
+  return extensions[name]?.find((entry) => entry.version === version);
 }
 
 const RESERVED_MEDIATED_FIELDS = new Set([
@@ -244,7 +399,7 @@ const RESERVED_MEDIATED_FIELDS = new Set([
 ]);
 
 function parseMediated(entry: ExtensionEntry | undefined): MediatedSignInConfig | undefined {
-  if (entry === undefined || entry.version !== "1") return undefined;
+  if (entry === undefined) return undefined;
   const fields = entry["fields"];
   const scopes = entry["scopes"];
   if (!Array.isArray(fields) || !Array.isArray(scopes)) return undefined;
@@ -270,10 +425,12 @@ function parseMediated(entry: ExtensionEntry | undefined): MediatedSignInConfig 
 const DIGEST = /^sha256:[0-9a-f]{64}$/;
 
 /**
- * Reads `skill_index` (spec 9.4). The index is ignored when `$schema` is absent or unknown, and entries of
- * an unknown `type`, or that are malformed, are skipped, so the rest of `poppy.json` stays usable.
+ * Reads a `skill_index` (spec 9.4). The index is ignored when `$schema` is absent or unknown, and entries
+ * of an unknown `type`, or that are malformed, are skipped, so the rest of the document stays usable.
+ * `base` is the final `poppy.json` URL on 0.3 and `tasks.endpoint` on 0.4, as each version resolves
+ * relative references against the document the index came in.
  */
-function parseSkillIndex(value: unknown, base: URL): Skill[] {
+export function parseSkillIndex(value: unknown, base: URL): Skill[] {
   if (
     !isObject(value) ||
     value["$schema"] !== SKILL_INDEX_SCHEMA ||
@@ -300,11 +457,11 @@ function parseSkillIndex(value: unknown, base: URL): Skill[] {
 }
 
 function parseUcp(
-  extensions: Record<string, ExtensionEntry>,
+  extensions: Record<string, ExtensionEntry[]>,
   agent: unknown,
   domain: string,
 ): UcpExtensionInfo | undefined {
-  if (extensions["ucp"]?.version !== "1") return undefined;
+  if (extensionEntry(extensions, "ucp", "1") === undefined) return undefined;
   const profileUrl = `${originOf(domain)}/.well-known/ucp`;
   const protocols = isObject(agent) && Array.isArray(agent["protocols"]) ? agent["protocols"] : [];
   const ask = protocols.some(
@@ -328,7 +485,7 @@ async function findIssuer(
   domain: string,
   authIssuer: string | undefined,
   allowPrivate: boolean,
-): Promise<string | undefined> {
+): Promise<{ issuer: string | undefined; scopesSupported: string[] | undefined }> {
   const resource = originOf(domain);
   const { status, body } = await getJson(
     fetchFn,
@@ -337,28 +494,32 @@ async function findIssuer(
     { allowPrivate, allowNotFound: true },
   );
   let servers: string[] = [];
+  // The domain's own scopes (RFC 9728 section 2, spec 3.2): a Personal Agent can request the scopes
+  // here or in the issuer's metadata, which a hosted issuer often can't tailor to one Company.
+  let scopesSupported: string[] | undefined;
   if (status !== 404) {
     if (!isObject(body))
       throw new PoppyProtocolError("protected resource metadata must be an object");
     if (body["resource"] !== resource)
       throw new PoppyProtocolError(`protected resource metadata resource must be ${resource}`);
     servers = optionalStringList(body["authorization_servers"], "authorization_servers") ?? [];
+    scopesSupported = optionalStringList(body["scopes_supported"], "scopes_supported");
   }
   if (servers.length === 0) {
     if (authIssuer !== undefined)
       throw new PoppyProtocolError("auth.issuer is set, but the domain names no issuer");
-    return undefined;
+    return { issuer: undefined, scopesSupported };
   }
   if (servers.length === 1) {
     if (authIssuer !== undefined && authIssuer !== servers[0])
       throw new PoppyProtocolError("auth.issuer must name the domain's authorization server");
-    return servers[0];
+    return { issuer: servers[0], scopesSupported };
   }
   if (authIssuer === undefined)
     throw new PoppyProtocolError("the domain lists several issuers, so auth.issuer is required");
   if (!servers.includes(authIssuer))
     throw new PoppyProtocolError("auth.issuer is not one of the domain's authorization servers");
-  return authIssuer;
+  return { issuer: authIssuer, scopesSupported };
 }
 
 /** RFC 9728 section 3.3 comparison, with the host compared ignoring case (spec 3.2). */
@@ -424,22 +585,60 @@ async function fetchOAuthServer(
  * Fetches a Company's `poppy.json`, its domain's protected resource metadata and its issuer's OAuth
  * metadata, and checks them as spec section 3 requires. Throws {@link PoppyProtocolError} on any failed
  * check, so nothing is sent to a Company that did not prove the link between its domain and issuer.
+ *
+ * When the Company serves several versions (spec 3.4), this picks the newest one this client implements
+ * and reads that version's document. {@link Company.protocolVersion} says which it chose, and the
+ * Session header carries it in `Poppy-Version` on every request.
  */
 export async function discover(website: string, options: DiscoverOptions = {}): Promise<Company> {
   const fetchFn = options.fetch ?? fetch;
   const allowPrivate = options.allowPrivateAddresses ?? false;
-  const { body: doc, url: finalUrl } = await getJson(fetchFn, websiteUrl(website), "poppy.json", {
-    allowPrivate,
-  });
+  const { body: published, url: finalUrl } = await getJson(
+    fetchFn,
+    websiteUrl(website),
+    "poppy.json",
+    { allowPrivate },
+  );
   // A redirect may only end at the well-known path, so an uploaded file can't speak for a domain (spec 3).
   if (finalUrl.pathname !== "/.well-known/poppy.json" || finalUrl.search !== "")
     throw new PoppyProtocolError("poppy.json redirected away from /.well-known/poppy.json");
-  if (!isObject(doc)) throw new PoppyProtocolError("poppy.json must be an object");
+  if (!isObject(published)) throw new PoppyProtocolError("poppy.json must be an object");
 
-  const version = string(doc["protocol_version"], "protocol_version");
-  if (!SUPPORTED_PROTOCOL_VERSIONS.includes(version)) {
-    throw new PoppyProtocolError(`protocol_version ${version} is not supported`);
+  const publishedVersion = string(published["protocol_version"], "protocol_version");
+  const supportedVersions = parseSupportedVersions(published["supported_versions"], finalUrl);
+  const choosable = choosableVersions(publishedVersion, supportedVersions);
+  if (choosable.length === 0) {
+    throw new PoppyProtocolError(
+      `${[publishedVersion, ...Object.keys(supportedVersions)].join(", ")} is not a protocol version this client supports`,
+    );
   }
+  // Newest first, taking the document for each in turn. A linked document that fails its checks is one
+  // this agent MUST NOT use (spec 3.4), so its version drops out and the next newest is tried; the
+  // Company's own poppy.json still works, rather than one bad link costing the whole Company.
+  let version: string | undefined;
+  let doc: Record<string, unknown> | undefined;
+  let documentUrl = finalUrl;
+  let refused: PoppyError | undefined;
+  for (const candidate of choosable) {
+    const linkedUrl = supportedVersions[candidate];
+    if (linkedUrl === undefined) {
+      version = candidate;
+      doc = published;
+      documentUrl = finalUrl;
+      break;
+    }
+    try {
+      doc = await fetchLinkedDocument(fetchFn, linkedUrl, candidate, allowPrivate);
+    } catch (error) {
+      refused ??= error instanceof PoppyError ? error : undefined;
+      continue;
+    }
+    version = candidate;
+    documentUrl = new URL(linkedUrl);
+    break;
+  }
+  if (version === undefined || doc === undefined)
+    throw refused ?? new PoppyProtocolError("no protocol version this client supports is usable");
 
   const organization = doc["organization"];
   if (!isObject(organization)) throw new PoppyProtocolError("organization is missing");
@@ -460,7 +659,12 @@ export async function discover(website: string, options: DiscoverOptions = {}): 
   const disabled = auth["disabled"] === true;
   const authIssuer =
     auth["issuer"] === undefined ? undefined : string(auth["issuer"], "auth.issuer");
-  const issuer = await findIssuer(fetchFn, domain, authIssuer, allowPrivate);
+  const { issuer, scopesSupported: resourceScopesSupported } = await findIssuer(
+    fetchFn,
+    domain,
+    authIssuer,
+    allowPrivate,
+  );
   const oauth =
     issuer === undefined
       ? undefined
@@ -470,23 +674,31 @@ export async function discover(website: string, options: DiscoverOptions = {}): 
   if (oauth === undefined && conversationProtocols.some((p) => p.access === "signed_in"))
     throw new PoppyProtocolError("a signed_in conversation protocol needs an issuer");
   const apis = parseApis(doc["apis"]);
-  const extensions = parseExtensions(doc["extensions"]);
+  const extensions = parseExtensions(doc["extensions"], version);
   const mediated =
     !disabled &&
     oauth?.grantTypesSupported.some((grant) => grant === MEDIATED_SIGN_IN_GRANT) === true
-      ? parseMediated(extensions["mediated-sign-in"])
+      ? parseMediated(extensionEntry(extensions, "mediated-sign-in", "1"))
       : undefined;
+  const web = isObject(doc["web"]) ? doc["web"] : undefined;
   const browserSessionEndpoint = optionalUrl(
-    doc["web"],
+    web,
     "browser_session_endpoint",
     "web.browser_session_endpoint",
   );
-  const feedbackEndpoint = optionalUrl(doc["feedback"], "endpoint", "feedback.endpoint");
-  const excludedTasksUrl = optionalUrl(doc["excluded_tasks"], "url", "excluded_tasks.url");
-  const extensionEndpoints = Object.entries(extensions).flatMap(([name, entry]) =>
-    typeof entry["endpoint"] === "string"
-      ? [httpsUrl(entry["endpoint"], `extensions.${name}.endpoint`).href]
-      : [],
+  // 0.4 moved excluded tasks, skills and feedback behind one per-Session endpoint (spec section 9).
+  const tasksEndpoint =
+    version === "0.3" ? undefined : optionalUrl(doc["tasks"], "endpoint", "tasks.endpoint");
+  const feedbackEndpoint =
+    version === "0.3" ? optionalUrl(doc["feedback"], "endpoint", "feedback.endpoint") : undefined;
+  const excludedTasksUrl =
+    version === "0.3" ? optionalUrl(doc["excluded_tasks"], "url", "excluded_tasks.url") : undefined;
+  const extensionEndpoints = Object.entries(extensions).flatMap(([name, entries]) =>
+    entries.flatMap((entry) =>
+      typeof entry["endpoint"] === "string"
+        ? [httpsUrl(entry["endpoint"], `extensions.${name}.endpoint`).href]
+        : [],
+    ),
   );
 
   const endpoints = [
@@ -494,6 +706,7 @@ export async function discover(website: string, options: DiscoverOptions = {}): 
     ...conversationProtocols.map((protocol) => protocol.endpoint),
     browserSessionEndpoint,
     feedbackEndpoint,
+    tasksEndpoint,
     ...extensionEndpoints,
   ].filter((url): url is string => url !== undefined);
   for (const url of [
@@ -510,6 +723,8 @@ export async function discover(website: string, options: DiscoverOptions = {}): 
 
   return {
     protocolVersion: version,
+    documentUrl: documentUrl.href,
+    supportedVersions,
     domain,
     name: typeof organization["name"] === "string" ? organization["name"] : domain,
     logoUri,
@@ -523,18 +738,47 @@ export async function discover(website: string, options: DiscoverOptions = {}): 
     },
     scopes: parseScopes(auth["scopes"]),
     scopeHints: parseScopeHints(auth["scope_hints"]),
+    resourceScopesSupported,
     conversationProtocols,
     apis,
     browserSessionEndpoint,
+    webDisabled: web?.["disabled"] === true && version !== "0.3",
+    webUnscoped: web?.["unscoped"] === true && version !== "0.3",
     feedbackEndpoint,
     excludedTasksUrl,
+    tasksEndpoint,
     extensions,
-    skills: parseSkillIndex(doc["skill_index"], finalUrl),
+    skills: version === "0.3" ? parseSkillIndex(doc["skill_index"], documentUrl) : [],
     ucp: parseUcp(extensions, doc["agent"], domain),
   };
 }
 
 /** Whether the Company lists `name` at `version` in its `extensions` (spec 3.3). */
 export function companySupports(company: Company, name: string, version: string): boolean {
-  return company.extensions[name]?.version === version;
+  return extensionEntry(company.extensions, name, version) !== undefined;
+}
+
+/**
+ * The Company's entry for an extension at a version, or undefined when it doesn't list that version
+ * (spec 3.3). On 0.4 a Company lists one entry per major version, each with its own fields.
+ */
+export function companyExtension(
+  company: Company,
+  name: string,
+  version: string,
+): ExtensionEntry | undefined {
+  return extensionEntry(company.extensions, name, version);
+}
+
+/**
+ * The scopes a Personal Agent can request: those the issuer lists and those the domain's protected
+ * resource metadata lists (spec 3.2, 4.7). From 0.4 either list may name them, and the agent uses both.
+ */
+export function supportedScopes(company: Company): string[] {
+  return [
+    ...new Set([
+      ...(company.oauth?.scopesSupported ?? []),
+      ...(company.resourceScopesSupported ?? []),
+    ]),
+  ];
 }

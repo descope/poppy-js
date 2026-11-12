@@ -16,6 +16,8 @@ export const FEEDBACK = `${API}/poppy/feedback`;
 export const EXCLUDED_TASKS = `https://${DOMAIN}/poppy/excluded-tasks.json`;
 /** Where the Company serves the document for the version poppy.json doesn't carry (spec 3.4). */
 export const LINKED_DOC = `https://${DOMAIN}/poppy/other.json`;
+/** An extra MCP API a document can list and later drop, to see which document a resolver follows. */
+export const EXTRA_MCP = "https://mcp.example.com/extra";
 
 const ES256 = { name: "ECDSA", hash: "SHA-256" } as const;
 const P256 = { name: "ECDSA", namedCurve: "P-256" } as const;
@@ -281,6 +283,9 @@ export class MockCompany {
         return this.#resource(url, method, headers, "orders:read", undefined);
       case MCP:
         return this.#resource(url, method, headers, "orders:read", MCP);
+      // An API a document can list and later drop; signed out, so it needs no scope or resource.
+      case EXTRA_MCP:
+        return this.#resource(url, method, headers, undefined, undefined);
       case `${API}/v1/exchanges`: {
         const denied = await this.#resource(url, method, headers, "orders:write", undefined);
         if (denied.status !== 200) return denied;

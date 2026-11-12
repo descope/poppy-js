@@ -15,6 +15,7 @@ import {
   CLIENT_ID,
   CONVERSATIONS,
   EXCLUDED_TASKS,
+  EXTRA_MCP,
   FEEDBACK,
   LINKED_DOC,
   MockCompany,
@@ -618,5 +619,51 @@ describe("continuing a Session across processes (spec 5.2, 5.5)", () => {
     await (await session.fetch(`${API}/v1/orders`)).body?.cancel();
     expect(session.id).not.toBe("sid_from_last_run");
     expect(mock.sessionClaims.map((c) => c["sid"])).toEqual(["sid_from_last_run", session.id]);
+  });
+});
+
+describe("rediscovery reads past the caches (spec 3.4, 5.2)", () => {
+  it("builds the resolver again rather than reusing one from an earlier discovery", async () => {
+    // An earlier 0.3 discovery lists an API the Company later drops. Rediscovering into 0.3 must
+    // follow the document it just read, not the one a cached resolver was built from.
+    let listExtra = true;
+    const mock = await MockCompany.create({
+      version: "0.3",
+      poppy: (doc) => ({
+        ...doc,
+        apis: listExtra
+          ? [...(doc["apis"] as unknown[]), { type: "mcp", url: EXTRA_MCP }]
+          : (doc["apis"] as unknown[]),
+      }),
+    });
+    const agent = new PoppyAgent({
+      clientId: CLIENT_ID,
+      signingKey: { privateKey: mock.agentKey.privateKey, kid: "k1" },
+      fetch: mock.fetch,
+      store: new MemoryStore(),
+    });
+
+    // 1. A 0.3 Session, which caches a resolver under this Company's 0.3 key.
+    const older = await agent.discover("example.com");
+    expect(older.protocolVersion).toBe("0.3");
+    (await agent.user(older, "alice")).session();
+
+    // 2. A 0.4 Session for the same Company, still listing the extra API.
+    mock.options.version = "0.4";
+    const newer = await agent.discover("example.com");
+    const session = (await agent.user(newer, "bob")).session();
+
+    // 3. The Company stops serving 0.4 and drops the extra API from its 0.3 document.
+    mock.options.versionUnsupported = true;
+    mock.options.versionAfterError = "0.3";
+    listExtra = false;
+
+    // The request is a destination under 0.4, so it goes out; the Company refuses the version, and
+    // the fresh 0.3 document no longer lists it. A resolver reused from step 1 would still say yes.
+    await expect(session.fetch(EXTRA_MCP)).rejects.toThrow(/is not an API or endpoint/);
+    expect(session.protocolVersion).toBe("0.3");
+    // Sent once, under 0.4 where the document listed it, and never retried under the 0.3 document
+    // that dropped it. A reused resolver would have let the retry through.
+    expect(mock.requests.filter((r) => r.url.startsWith(EXTRA_MCP))).toHaveLength(1);
   });
 });

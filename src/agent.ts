@@ -372,18 +372,23 @@ export class PoppyAgent {
    * Keyed by version, so a Session that moves to another version doesn't hand its resolver to the
    * `PoppyUser`s still holding the Company it discovered first: that resolver knows that version's
    * endpoints, and would make the other version's destinations unreachable.
+   *
+   * The resolver is always built again, never taken from the cache. A cached one wraps the Company
+   * an earlier discovery found, and this is the one path whose whole purpose is to go past what was
+   * cached: reusing it would let `isDestination` accept an endpoint the Company's current document
+   * has dropped, and attach credentials to it (spec 5.2). It replaces the cached entry, so Sessions
+   * opened afterwards get the newest document rather than that earlier one. Holders of the old
+   * resolver keep it, which leaves each of them with the Company and resolver from one discovery
+   * rather than a mix of two; the only thing they don't share is an endpoint added later through
+   * `addExtensionEndpoint`, which a version change already discards.
    */
   #rediscover(company: Company): Promise<Rediscovered> {
     return discover(company.domain, {
       fetch: this.#fetch,
       allowPrivateAddresses: this.#allowPrivate,
     }).then((found) => {
-      const key = this.#resolverKey(found);
-      let resolver = this.#resolvers.get(key);
-      if (resolver === undefined) {
-        resolver = new ResourceResolver(found, this.#fetch, this.#allowPrivate);
-        this.#resolvers.set(key, resolver);
-      }
+      const resolver = new ResourceResolver(found, this.#fetch, this.#allowPrivate);
+      this.#resolvers.set(this.#resolverKey(found), resolver);
       return { company: found, resolver };
     });
   }

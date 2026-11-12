@@ -87,6 +87,22 @@ Two areas behave differently on each version, and the SDK gives you one API for 
 
 `agent.user(company, "your-own-user-id")` returns the User's **User ID** at that Company. The SDK generates it at random the first time and keeps it in your store, so it's stable, different at every Company, and not derived from anything personal (spec 5.1). The Company never sees your own user ID.
 
+`user.session()` opens a Session. It makes no request: the `sid` is yours to choose, and the Session starts at the Company when the first request carrying it arrives (spec 5.2). Run several at once for tasks in parallel; they share the account's sign-in.
+
+### Carrying a Session across processes
+
+A Session lasts until you stop using its `sid` (spec 5.5), not until a process exits. An agent that doesn't stay running — a CLI, a queue worker, a serverless handler — would otherwise open a new Session for every invocation, and the Company would see one User's activity as a crowd of unrelated Sessions, with the cart and the open conversation each belonging to one that never comes back.
+
+Save `session.id` and pass it back:
+
+```typescript
+const session = user.session({ id: savedSessionId });
+// ... use it ...
+await save(session.id); // read it again after: it changes if the Company ended the Session
+```
+
+Resume a `sid` only under the User that started it. Every Session JWT of a Session carries the same `sub` and Agent ID, and a Company rejects one that doesn't (spec 5.2, 5.3). If the Company has ended it, the next request gets `session_ended`, and the SDK starts a new Session with a new `sid` and sends the request again, once — so read `session.id` back after a request rather than assuming the one you passed in is still current.
+
 Every request to the Company's APIs, conversations and other protocol endpoints carries a `Poppy-Session` header: a JWT signed fresh for that one request (spec 5.2). Your signing key doesn't sign it directly. Instead, it signs a short-lived **delegation** that vouches for a **delegated key**, and the delegated key signs the Session JWTs.
 
 ```mermaid

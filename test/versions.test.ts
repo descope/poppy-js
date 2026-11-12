@@ -580,3 +580,43 @@ describe("review findings (PR #15)", () => {
     expect(seen).toContain("working");
   });
 });
+
+describe("continuing a Session across processes (spec 5.2, 5.5)", () => {
+  it("resumes the sid it is given, and sends it on the wire", async () => {
+    const { user, mock } = await setup({ version: "0.4" });
+    const first = user.session();
+    const id = first.id;
+    await (await first.fetch(`${API}/v1/orders`)).body?.cancel();
+
+    // A second process, with the same stored User: the Session carries on rather than starting over.
+    const resumed = user.session({ id });
+    expect(resumed.id).toBe(id);
+    await (await resumed.fetch(`${API}/v1/orders`)).body?.cancel();
+    const sids = mock.sessionClaims.map((claims) => claims["sid"]);
+    expect(sids).toEqual([id, id]);
+    // Every Session JWT of a Session carries the same sub, which a Company checks (spec 5.3).
+    expect(new Set(mock.sessionClaims.map((claims) => claims["sub"])).size).toBe(1);
+  });
+
+  it("makes a fresh one when no id is given", async () => {
+    const { user } = await setup({ version: "0.4" });
+    expect(user.session().id).not.toBe(user.session().id);
+  });
+
+  it("refuses an id a Company would reject", async () => {
+    const { user } = await setup({ version: "0.4" });
+    for (const id of ["", "has spaces", "slash/es", "x".repeat(257)])
+      expect(() => user.session({ id })).toThrow(PoppyProtocolError);
+    expect(user.session({ id: "x".repeat(256) }).id).toBe("x".repeat(256));
+  });
+
+  it("leaves a resumed Session behind when the Company says it ended", async () => {
+    // session_ended means the old Session's state doesn't carry over, so the SDK starts a new one
+    // with a new sid and sends the request again, once (spec 5.5).
+    const { user, mock } = await setup({ version: "0.4", sessionEndedOnce: true });
+    const session = user.session({ id: "sid_from_last_run" });
+    await (await session.fetch(`${API}/v1/orders`)).body?.cancel();
+    expect(session.id).not.toBe("sid_from_last_run");
+    expect(mock.sessionClaims.map((c) => c["sid"])).toEqual(["sid_from_last_run", session.id]);
+  });
+});

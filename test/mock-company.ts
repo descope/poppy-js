@@ -43,6 +43,8 @@ export interface MockOptions {
   excludedTasksFails?: boolean;
   /** Report `working: true` on the first events read of a conversation, then false. */
   workingFirstRead?: boolean;
+  /** Answer the first request of each Session with session_ended, as a Company that ended it does. */
+  sessionEndedOnce?: boolean;
   /** Token type the server issues; `DPoP` also requires a proof. */
   tokenType?: "Bearer" | "DPoP";
   /** Return a new refresh token on every refresh. */
@@ -104,6 +106,7 @@ export class MockCompany {
   rejectNextToken = false;
   #counter = 0;
   #reads = 0;
+  readonly #endedSids = new Set<string>();
   #nonceIssued = false;
 
   constructor(agentKey: CryptoKeyPair, options: MockOptions = {}) {
@@ -545,6 +548,12 @@ export class MockCompany {
     )
       return json(400, { error: "invalid_session", error_description: "claims" });
     this.sessionClaims.push(payload);
+    // A Company that ended this Session: the first request with each sid gets session_ended, so the
+    // agent starts a new one with a new sid and sends the request again, once (spec 5.5).
+    if (this.options.sessionEndedOnce === true && !this.#endedSids.has(String(payload["sid"]))) {
+      this.#endedSids.add(String(payload["sid"]));
+      return json(400, { error: "session_ended" });
+    }
 
     const authorization = headers.get("authorization");
     const challenge =

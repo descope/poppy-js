@@ -39,11 +39,16 @@ export interface Rediscovered {
   resolver: ResourceResolver;
 }
 
+/** The characters a Session ID may use, as the Company checks them (spec 5.2, 8.2). */
+const SID = /^[A-Za-z0-9_-]{1,256}$/;
+
 export interface SessionInit {
   company: Company;
   clientId: string;
   userId: string;
   agentId: string | undefined;
+  /** A `sid` to continue, from an earlier Session's {@link Session.id}. A new one is made without it. */
+  sid?: string | undefined;
   keys: DelegatedKeys;
   account: Account | undefined;
   resolver: ResourceResolver;
@@ -103,7 +108,7 @@ export class Session {
   #resolver: ResourceResolver;
   #extensionsHeader: string | undefined;
   readonly #init: SessionInit;
-  #sid = randomId();
+  #sid: string;
   #ended = false;
   #versionRetried = false;
   #coverage: Promise<TaskCoverage> | undefined;
@@ -114,6 +119,9 @@ export class Session {
     this.#extensionsHeader = extensionsHeader(init.company, init.extensions);
     this.userId = init.userId;
     this.agentId = init.agentId;
+    if (init.sid !== undefined && !SID.test(init.sid))
+      throw new PoppyProtocolError("a Session ID is 1 to 256 URL-safe base64 characters");
+    this.#sid = init.sid ?? randomId();
     this.#init = init;
   }
 
@@ -130,7 +138,15 @@ export class Session {
     return this.#company.protocolVersion;
   }
 
-  /** The Session ID (`sid`). Not a credential, but don't use it for anything else (spec 5.2). */
+  /**
+   * The Session ID (`sid`). Not a credential, but don't use it for anything else (spec 5.2).
+   *
+   * Save it to carry one Session across processes: a Session lasts until the agent stops using its
+   * `sid` (spec 5.5), so an agent that doesn't stay running — a CLI, a queue worker — keeps the
+   * Company's view of the User's activity together by passing it back to {@link PoppyUser.session}.
+   * It changes when the Company ends the Session, or when a version switch starts a new one, so read
+   * it again after each request rather than saving it once.
+   */
   get id(): string {
     return this.#sid;
   }

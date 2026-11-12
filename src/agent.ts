@@ -481,14 +481,23 @@ export class PoppyUser {
   /**
    * Starts a new Session with a fresh random `sid` (spec 5.2). Run several for tasks in parallel. Sessions
    * share this account's sign-in.
+   *
+   * Pass `id` to continue a Session this same User started, with the `sid` you saved from
+   * {@link Session.id}. A Session lasts until the agent stops using its `sid` (spec 5.5), so an agent
+   * that doesn't stay running keeps one Session rather than opening a new one for every command, and
+   * the Company sees the User's activity as the one Session it is. Only ever resume a `sid` under the
+   * User that started it: every Session JWT for a Session carries the same `sub` and Agent ID, and a
+   * Company rejects one that doesn't (spec 5.2, 5.3). If the Company has ended it, the next request
+   * gets `session_ended` and this SDK starts a new Session with a new `sid` on its own.
    */
-  session(): Session {
+  session(options: { id?: string } = {}): Session {
     return new Session({
       company: this.company,
       clientId: this.#agent.clientId,
       userId: this.userId,
       agentId: this.agentId,
       account: this.#init.account,
+      ...(options.id === undefined ? {} : { sid: options.id }),
       ...this.#sessionInit(),
     });
   }

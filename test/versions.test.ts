@@ -781,3 +781,31 @@ describe("review round two (PR #15)", () => {
     expect(company.supportedVersions).toEqual({});
   });
 });
+
+describe("a Session forgets what the last one was told (spec 5.2, 9)", () => {
+  it("stops treating the old feedback endpoint as a destination after session_ended", async () => {
+    const { user, mock } = await setup({ version: "0.4", endedSids: ["sid_one"] });
+    const session = user.session({ id: "sid_one" });
+    // The tasks response names the feedback endpoint, which becomes this Session's destination.
+    expect((await session.taskCoverage()).feedbackEndpoint).toBe(FEEDBACK);
+    // That Session is gone; the endpoint it named goes with it.
+    await (await session.fetch(TASKS)).body?.cancel();
+    mock.options.tasks = { excluded_tasks: [] };
+    await expect(
+      session.sendFeedback({ task: "Pay with a gift card", description: "No API offered one." }),
+    ).rejects.toThrow(/has no feedback endpoint/);
+  });
+
+  it("stops treating it as a destination after a version switch", async () => {
+    const { session } = await setup({
+      version: "0.4",
+      versionUnsupported: true,
+      versionAfterError: "0.3",
+    });
+    await session.taskCoverage();
+    await (await session.fetch(`${API}/v1/orders`)).body?.cancel();
+    expect(session.protocolVersion).toBe("0.3");
+    // 0.3 names its own feedback endpoint in poppy.json; the 0.4 answer is not carried over.
+    expect((await session.taskCoverage()).feedbackEndpoint).toBe(FEEDBACK);
+  });
+});

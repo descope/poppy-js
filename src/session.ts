@@ -114,6 +114,16 @@ export class Session {
   /** The 0.4 feedback endpoint this Session was given, which belongs to it alone (spec section 9). */
   #feedbackEndpoint: string | undefined;
 
+  /**
+   * Drops everything a tasks response taught this Session. The feedback endpoint goes with the
+   * coverage it came in: it is a destination only because that response named it, so a new Session,
+   * or a new version whose document may name none, must not keep sending requests there (spec 5.2).
+   */
+  #forgetCoverage(): void {
+    this.#coverage = undefined;
+    this.#feedbackEndpoint = undefined;
+  }
+
   constructor(init: SessionInit) {
     this.#company = init.company;
     this.#resolver = init.resolver;
@@ -271,7 +281,7 @@ export class Session {
         sessionRetried = true;
         this.#sid = randomId();
         // A new Session: the old one's excluded tasks and feedback endpoint were its own (spec 9).
-        this.#coverage = undefined;
+        this.#forgetCoverage();
         await response.body?.cancel();
         continue;
       }
@@ -345,7 +355,7 @@ export class Session {
     this.#company = found.company;
     this.#resolver = found.resolver;
     this.#extensionsHeader = extensionsHeader(found.company, this.#init.extensions);
-    this.#coverage = undefined;
+    this.#forgetCoverage();
     this.#sid = randomId();
     return true;
   }
@@ -421,7 +431,7 @@ export class Session {
     // nothing when it gets no answer, but a rate limit or a 5xx says nothing about the rest of the
     // Session, and caching it would hide the Company's tasks until the Session ends.
     this.#coverage ??= this.#fetchCoverage().catch(() => {
-      this.#coverage = undefined;
+      this.#forgetCoverage();
       return EMPTY_COVERAGE;
     });
     return this.#coverage;

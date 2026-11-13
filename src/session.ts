@@ -538,9 +538,17 @@ export class Session {
     // A failure isn't remembered: spec section 9 has the agent carry on as if the Company published
     // nothing when it gets no answer, but a rate limit or a 5xx says nothing about the rest of the
     // Session, and caching it would hide the Company's tasks until the Session ends.
+    return this.#startCoverage(0);
+  }
+
+  /**
+   * Starts a tasks request, or returns the one already in flight. `attempt` bounds the case where a
+   * Session keeps moving out from under the request, so this can't ask forever.
+   */
+  #startCoverage(attempt: number): Promise<TaskCoverage> {
     if (this.#coverage === undefined) {
       const generation = this.#coverageGeneration;
-      this.#coverage = this.#fetchCoverage(generation).catch(() => {
+      this.#coverage = this.#fetchCoverage(generation, attempt).catch(() => {
         // Only this request's own failure is forgotten: a newer one may already have an answer.
         if (generation === this.#coverageGeneration) this.#forgetCoverage();
         return EMPTY_COVERAGE;
@@ -549,7 +557,7 @@ export class Session {
     return this.#coverage;
   }
 
-  async #fetchCoverage(generation: number): Promise<TaskCoverage> {
+  async #fetchCoverage(generation: number, attempt: number): Promise<TaskCoverage> {
     const company = this.company;
     if (company.protocolVersion === "0.3") {
       // Only the excluded tasks need a request on 0.3: the skills and the feedback endpoint are
@@ -572,10 +580,15 @@ export class Session {
     const coverage = parseTaskCoverage(body, company, endpoint);
     // The feedback endpoint comes from this response rather than poppy.json, so it becomes a Session
     // destination only once the Company has named it (spec 5.2).
-    // A Session that ended, or moved version, while this was in flight has already forgotten its
-    // coverage; this answer belonged to that one, so it must not become this Session's destination.
-    if (coverage.feedbackEndpoint !== undefined && generation === this.#coverageGeneration)
-      this.#feedbackEndpoint = coverage.feedbackEndpoint;
+    if (generation !== this.#coverageGeneration) {
+      // The Session moved on while this was in flight: another request ended it or changed version,
+      // or `fetch()` retried this very request under a new `sid`. Either way this answer isn't the
+      // current Session's to keep, and handing back an endpoint `fetch()` would then refuse is
+      // worse than asking again under the Session that is current now.
+      if (attempt >= MAX_COVERAGE_ATTEMPTS) return EMPTY_COVERAGE;
+      return this.#startCoverage(attempt + 1);
+    }
+    if (coverage.feedbackEndpoint !== undefined) this.#feedbackEndpoint = coverage.feedbackEndpoint;
     return coverage;
   }
 
@@ -647,6 +660,9 @@ export class Session {
     throw await throwable(response);
   }
 }
+
+/** How many times a tasks request may be started again when the Session moves under it. */
+const MAX_COVERAGE_ATTEMPTS = 2;
 
 /** How many redirects a website page may take before this agent gives up (spec 5.2). */
 const MAX_PAGE_REDIRECTS = 5;

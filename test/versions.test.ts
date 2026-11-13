@@ -876,3 +876,28 @@ describe("website pages fetched without a browser (spec 5.2, 5.6)", () => {
     await expect(session.fetchPage("http://example.com/x")).rejects.toThrow(PoppyProtocolError);
   });
 });
+
+describe("a tasks request the Session outlived (spec 5.5, 9)", () => {
+  const V4_FEEDBACK = `${API}/poppy/feedback-v4`;
+
+  it("keeps the answer when its own request was retried under a new sid", async () => {
+    // The tasks GET meets session_ended, so fetch() starts a new Session and sends it again. The
+    // answer that comes back is this Session's, and must not be thrown away for being late.
+    const { user, mock } = await setup({
+      version: "0.4",
+      tasks: { feedback: { endpoint: V4_FEEDBACK } },
+    });
+    const session = user.session();
+    mock.options.endedSids = [session.id];
+    const coverage = await session.taskCoverage();
+    expect(coverage.feedbackEndpoint).toBe(V4_FEEDBACK);
+    expect(session.id).not.toBe(mock.options.endedSids[0]);
+    // The endpoint it returned is one this Session will actually send to.
+    const response = await session.fetch(V4_FEEDBACK, { method: "POST", body: "{}" });
+    await response.body?.cancel();
+    // Asked again, it is already known: no second trip for an answer this Session kept.
+    const before = mock.requests.filter((r) => r.url === TASKS).length;
+    await session.taskCoverage();
+    expect(mock.requests.filter((r) => r.url === TASKS)).toHaveLength(before);
+  });
+});

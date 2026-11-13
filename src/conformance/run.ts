@@ -38,6 +38,14 @@ export interface AgentDriver {
   handoffThenCancel?(text: string): Promise<void>;
   /** Fetches one of the Company's skills and checks it against its digest (9.4). */
   readSkill?(name: string): Promise<void>;
+  /** Signs in with Device Sign-In: shows the User the link, then polls until approved (4.3). */
+  signInDevice?(scope: string[]): Promise<void>;
+  /** Opens a new Session for the same User, as a later run of the agent would (5.2). */
+  newSession?(): Promise<void>;
+  /** Sends a request, waits out the `Retry-After` of a 429, and sends it again (5.6). */
+  requestRateLimited?(url: string): Promise<void>;
+  /** Talks to the Company Agent and approves the operation it asks for in a message (8.4). */
+  converseWithApproval?(text: string): Promise<void>;
 }
 
 /** Makes a fresh agent, with no state, that sends all of its HTTP through `fetch`. */
@@ -181,6 +189,20 @@ async function runStep(
     case "read_skill":
       if (driver.readSkill === undefined) throw new Error("the driver has no readSkill()");
       return driver.readSkill(step.name);
+    case "sign_in_device":
+      if (driver.signInDevice === undefined) throw new Error("the driver has no signInDevice()");
+      return driver.signInDevice(step.scopes);
+    case "new_session":
+      if (driver.newSession === undefined) throw new Error("the driver has no newSession()");
+      return driver.newSession();
+    case "request_rate_limited":
+      if (driver.requestRateLimited === undefined)
+        throw new Error("the driver has no requestRateLimited()");
+      return driver.requestRateLimited(step.url);
+    case "converse_with_approval":
+      if (driver.converseWithApproval === undefined)
+        throw new Error("the driver has no converseWithApproval()");
+      return driver.converseWithApproval(step.text);
   }
 }
 

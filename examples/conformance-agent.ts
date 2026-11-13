@@ -11,6 +11,7 @@ import {
   approvalFor,
   type Company,
   operationFromResponse,
+  operatorKeyId,
   PoppyAgent,
   PoppyError,
   type PoppyUser,
@@ -29,7 +30,11 @@ type Step =
   | { action: "join_browser" }
   | { action: "fetch_page"; url: string }
   | { action: "handoff_then_cancel"; text: string }
-  | { action: "read_skill"; name: string };
+  | { action: "read_skill"; name: string }
+  | { action: "sign_in_device"; scopes: string[] }
+  | { action: "new_session" }
+  | { action: "request_rate_limited"; url: string }
+  | { action: "converse_with_approval"; text: string };
 
 interface Context {
   steps: Step[];
@@ -57,6 +62,19 @@ const agent = new PoppyAgent({
   },
   redirectUri: context.redirect_uri,
   extensions: { operations: { version: "2" } },
+  // Web Bot Auth, so bot defenses can recognize the operator (spec 5.3). The key is made for this
+  // run: a real agent publishes its public key in a key directory and keeps the private one.
+  operatorSignature: await (async () => {
+    const pair = (await crypto.subtle.generateKey({ name: "Ed25519" }, true, [
+      "sign",
+      "verify",
+    ])) as CryptoKeyPair;
+    return {
+      privateKey: pair.privateKey,
+      keyId: await operatorKeyId(pair.publicKey),
+      signatureAgent: new URL("/keys", context.client_id).href,
+    };
+  })(),
 });
 
 let company: Company | undefined;
@@ -148,6 +166,47 @@ async function run(step: Step): Promise<void> {
     case "read_skill":
       await ready().session.fetchSkill(step.name);
       return;
+    case "sign_in_device": {
+      const started = await ready().user.startDeviceSignIn({ scope: step.scopes });
+      // A real agent shows verificationUri and userCode with the Company's name and domain; the
+      // SDK has already checked the link's host (spec 4.3).
+      await started.wait();
+      return;
+    }
+    case "new_session":
+      session = ready().user.session();
+      return;
+    case "request_rate_limited": {
+      const { session: s } = ready();
+      const first = await s.fetch(step.url);
+      await first.body?.cancel();
+      if (first.status === 429) {
+        // Retry-After is a floor, not a suggestion (spec 5.6).
+        const seconds = Number(first.headers.get("retry-after") ?? 0);
+        await new Promise((resolve) => setTimeout(resolve, seconds * 1000 + 50));
+      }
+      const again = await s.fetch(step.url);
+      await again.body?.cancel();
+      return;
+    }
+    case "converse_with_approval": {
+      const { session: s } = ready();
+      const { conversation, update } = await s
+        .conversations()
+        .start({ text: step.text }, { wait: 2 });
+      let events = update.events;
+      if (!events.some((e) => e.type === "message"))
+        events = (await conversation.readAll({ wait: 2 })).events;
+      const operation = events
+        .flatMap((e) => (e.type === "message" && e.message.operation ? [e.message.operation] : []))
+        .at(-1);
+      if (operation === undefined) throw new Error("the Company Agent asked for no approval");
+      await conversation.send({
+        text: "The user approved this.",
+        approval: approvalFor(operation),
+      });
+      return;
+    }
     case "request_with_approval": {
       const { session: s } = ready();
       const init = { method: step.method, body: step.body };

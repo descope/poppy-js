@@ -154,6 +154,19 @@ export const CHECKS: readonly Check[] = [
     title: "Every Session JWT of a Session has the same sub and agent_id",
   },
   {
+    id: "session.operator-signature",
+    section: "5.3",
+    level: "SHOULD",
+    title:
+      "Signs requests carrying the Session header with an HTTP Message Signature that covers poppy-session, and authorization when present",
+  },
+  {
+    id: "session.rate-limit",
+    section: "5.6",
+    level: "MUST",
+    title: "Waits at least Retry-After before sending a rate-limited request again",
+  },
+  {
     id: "session.not-to-oauth",
     section: "5.2",
     level: "MUST",
@@ -230,6 +243,13 @@ export const CHECKS: readonly Check[] = [
     level: "SHOULD",
     title:
       "Supports DPoP: proofs on token requests when advertised, and on requests with DPoP-bound tokens",
+  },
+  {
+    id: "oauth.device-link",
+    section: "4.3",
+    level: "MUST",
+    title:
+      "Refuses a Device Sign-In link whose host is neither the issuer's nor organization.domain, nor a subdomain of either",
   },
   {
     id: "oauth.resource-token",
@@ -329,6 +349,19 @@ export const CHECKS: readonly Check[] = [
 
   // Task coverage
   {
+    id: "tasks.per-session",
+    section: "9",
+    level: "MUST",
+    title:
+      "Gets task coverage again in a new Session rather than reusing another Session's answer (0.4)",
+  },
+  {
+    id: "tasks.not-excluded",
+    section: "9.3",
+    level: "SHOULD",
+    title: "Doesn't report a task the Company already lists as excluded",
+  },
+  {
     id: "tasks.feedback",
     section: "9.3",
     level: "MUST",
@@ -340,6 +373,13 @@ export const CHECKS: readonly Check[] = [
     section: "9.4",
     level: "MUST",
     title: "Checks a skill artifact against its digest, and carries no credential when fetching it",
+  },
+
+  {
+    id: "conversation.extension-version",
+    section: "8.4",
+    level: "MUST",
+    title: "Sends extension content in a message only for an extension and version both sides use",
   },
 
   // Extensions

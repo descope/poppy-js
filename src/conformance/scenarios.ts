@@ -37,7 +37,15 @@ export type Step =
   /** Ask for a person at the Company, then withdraw the request (spec 8.9). */
   | { action: "handoff_then_cancel"; text: string }
   /** Fetch one of the Company's skills and check it against its digest (spec 9.4). */
-  | { action: "read_skill"; name: string };
+  | { action: "read_skill"; name: string }
+  /** Sign in with Device Sign-In: show the User the link, then poll until it is approved (4.3). */
+  | { action: "sign_in_device"; scopes: string[] }
+  /** Open a new Session, as a later run of the same agent for the same User would (spec 5.2). */
+  | { action: "new_session" }
+  /** Send a request the Company rate-limits, wait out `Retry-After`, and send it again (5.6). */
+  | { action: "request_rate_limited"; url: string }
+  /** Talk to the Company Agent, and approve the operation it asks for in a message (8.4). */
+  | { action: "converse_with_approval"; text: string };
 
 /** Which parts of the protocol a scenario exercises. */
 export type Suite = "core" | "oauth" | "interactions" | "versions";
@@ -373,6 +381,57 @@ export const SCENARIOS: readonly ScenarioDefinition[] = [
     suite: "interactions",
     company: {},
     steps: [discover, { action: "join_browser" }],
+  },
+  {
+    name: "device-sign-in",
+    description: "Device Sign-In: the User approves on the Company's own page.",
+    suite: "oauth",
+    company: {},
+    steps: [discover, { action: "sign_in_device", scopes: ["orders:read"] }, orders],
+  },
+  {
+    name: "v04-device-sign-in-offsite-link",
+    description:
+      "0.4: the Device Sign-In link is on a protected_resources host, which 0.4 no longer allows.",
+    suite: "oauth",
+    company: { version: "0.4", deviceLinkOffsite: true },
+    steps: [discover, { action: "sign_in_device", scopes: ["orders:read"] }],
+    evaluate: (c) => c.checkDeviceLink(),
+  },
+  {
+    name: "rate-limited",
+    description: "The API answers 429 with Retry-After before it answers the request.",
+    suite: "core",
+    company: { rateLimitSeconds: 1 },
+    steps: [discover, { action: "request_rate_limited", url: `${API}/orders` }],
+  },
+  {
+    name: "v04-task-coverage-per-session",
+    description:
+      "0.4: a second Session asks for task coverage again rather than reusing the first's.",
+    suite: "interactions",
+    company: { version: "0.4" },
+    steps: [
+      discover,
+      { action: "task_coverage" },
+      { action: "new_session" },
+      { action: "task_coverage" },
+    ],
+  },
+  {
+    name: "conversation-approval",
+    description:
+      "The Company Agent asks for approval in a message, and the agent answers with one.",
+    suite: "interactions",
+    company: { operationInConversation: true },
+    steps: [discover, { action: "converse_with_approval", text: "Exchange the jacket, please." }],
+  },
+  {
+    name: "v04-conversation-approval",
+    description: "0.4: the same, where the request itself declares the extension it uses.",
+    suite: "interactions",
+    company: { version: "0.4", operationInConversation: true },
+    steps: [discover, { action: "converse_with_approval", text: "Exchange the jacket, please." }],
   },
   {
     name: "v04-version-unsupported",

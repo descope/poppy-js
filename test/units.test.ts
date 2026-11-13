@@ -12,7 +12,7 @@ import {
   PoppyProtocolError,
   renderSummary,
 } from "../src/index.ts";
-import { isPrivateHost } from "../src/http.ts";
+import { isPrivateHost, withoutTrailingSlashes } from "../src/http.ts";
 import { signOperator } from "../src/operator.ts";
 import { DelegatedKeys, MAX_DELEGATION_LIFETIME, signSessionJwt } from "../src/session-jwt.ts";
 import { decodeJwt, signerFromKey, thumbprint } from "../src/jose.ts";
@@ -292,5 +292,25 @@ describe("signing keys", () => {
       "sign",
     ]);
     expect(() => signerFromKey({ privateKey: pair.privateKey, kid: "k1" })).toThrow("P-256");
+  });
+});
+
+describe("withoutTrailingSlashes", () => {
+  it("drops only trailing slashes, and leaves everything else alone", () => {
+    expect(withoutTrailingSlashes("https://example.com/api/")).toBe("https://example.com/api");
+    expect(withoutTrailingSlashes("https://example.com/api///")).toBe("https://example.com/api");
+    expect(withoutTrailingSlashes("https://example.com/api")).toBe("https://example.com/api");
+    expect(withoutTrailingSlashes("/")).toBe("");
+    expect(withoutTrailingSlashes("")).toBe("");
+    // Interior slashes stay: only the end is trimmed.
+    expect(withoutTrailingSlashes("https://e.test///a///b")).toBe("https://e.test///a///b");
+  });
+
+  it("stays linear on the input a backtracking regex would struggle with", () => {
+    // `/\/+$/` on a long run of slashes that doesn't end the string is the polynomial case.
+    const hostile = `https://example.com/${"/".repeat(50_000)}x`;
+    const started = performance.now();
+    expect(withoutTrailingSlashes(hostile)).toBe(hostile);
+    expect(performance.now() - started).toBeLessThan(50);
   });
 });

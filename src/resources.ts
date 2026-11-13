@@ -1,6 +1,14 @@
 import type { Api, Company } from "./discovery.ts";
 import { PoppyProtocolError } from "./errors.ts";
-import { type Fetch, getJson, getText, isObject, originOf, resourceMetadataUrl } from "./http.ts";
+import {
+  type Fetch,
+  getJson,
+  getText,
+  isObject,
+  originOf,
+  resourceMetadataUrl,
+  withoutTrailingSlashes,
+} from "./http.ts";
 
 /** Which access token a request uses (spec 4.5). */
 export interface ResourceChoice {
@@ -162,7 +170,8 @@ export class ResourceResolver {
       throw new PoppyProtocolError(`MCP server metadata resource must equal ${service.url}`);
     // From 0.4, metadata whose resource isn't the URL its URL was derived from is treated as absent, as
     // RFC 9728 section 3.3 requires (spec 4.5), so the default token is used instead.
-    const sameResource = (a: string, b: string) => a.replace(/\/+$/, "") === b.replace(/\/+$/, "");
+    const sameResource = (a: string, b: string) =>
+      withoutTrailingSlashes(a) === withoutTrailingSlashes(b);
     if (this.#company.protocolVersion !== "0.3" && !sameResource(resource, service.url))
       return { ...DEFAULT, service: service.url };
     // The domain's own resource means the default token works here (spec 4.5).

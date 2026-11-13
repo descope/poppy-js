@@ -614,9 +614,13 @@ describe("continuing a Session across processes (spec 5.2, 5.5)", () => {
   it("leaves a resumed Session behind when the Company says it ended", async () => {
     // session_ended means the old Session's state doesn't carry over, so the SDK starts a new one
     // with a new sid and sends the request again, once (spec 5.5).
-    const { user, mock } = await setup({ version: "0.4", sessionEndedOnce: true });
+    const { user, mock } = await setup({ version: "0.4", endedSids: ["sid_from_last_run"] });
     const session = user.session({ id: "sid_from_last_run" });
-    await (await session.fetch(`${API}/v1/orders`)).body?.cancel();
+    // The tasks endpoint needs no scope, so a 200 says the retry was handled rather than merely
+    // getting past the Session check and stopping at a challenge.
+    const response = await session.fetch(TASKS);
+    await response.body?.cancel();
+    expect(response.status).toBe(200);
     expect(session.id).not.toBe("sid_from_last_run");
     expect(mock.sessionClaims.map((c) => c["sid"])).toEqual(["sid_from_last_run", session.id]);
   });
@@ -665,5 +669,115 @@ describe("rediscovery reads past the caches (spec 3.4, 5.2)", () => {
     // Sent once, under 0.4 where the document listed it, and never retried under the 0.3 document
     // that dropped it. A reused resolver would have let the retry through.
     expect(mock.requests.filter((r) => r.url.startsWith(EXTRA_MCP))).toHaveLength(1);
+  });
+});
+
+describe("review round two (PR #15)", () => {
+  it("refuses to resume an anonymous User's Session", async () => {
+    const { agent, company } = await setup({ version: "0.4" });
+    expect(() => agent.anonymousUser(company).session({ id: "sid_x" })).toThrow(PoppyProtocolError);
+    // Without an id it is fine: an anonymous User just never continues one.
+    expect(agent.anonymousUser(company).session().id).toMatch(/^[A-Za-z0-9_-]+$/);
+  });
+
+  it("starts a new Session when the saved id belongs to another version", async () => {
+    const { user } = await setup({ version: "0.4" });
+    // Saved while the Company served 0.3; it serves 0.4 now, and a Session keeps one version
+    // throughout (spec 3.4), so the old sid is not sent under this one.
+    const session = user.session({ id: "sid_from_0_3", protocolVersion: "0.3" });
+    expect(session.id).not.toBe("sid_from_0_3");
+    // The same version resumes as before.
+    expect(user.session({ id: "sid_now", protocolVersion: "0.4" }).id).toBe("sid_now");
+  });
+
+  it("chooses again on a second version_unsupported in one Session", async () => {
+    // The retry budget is per request, so a Session that switched once isn't stuck afterwards.
+    const { session, mock } = await setup({
+      version: "0.4",
+      versionUnsupported: true,
+      versionAfterError: "0.3",
+    });
+    await (await session.fetch(`${API}/v1/orders`)).body?.cancel();
+    expect(session.protocolVersion).toBe("0.3");
+    mock.options.versionUnsupported = true;
+    mock.options.versionAfterError = "0.4";
+    await (await session.fetch(`${API}/v1/orders`)).body?.cancel();
+    expect(session.protocolVersion).toBe("0.4");
+  });
+
+  it("drops a Session's task coverage when the Company ends it", async () => {
+    const { user, mock } = await setup({ version: "0.4", endedSids: ["sid_one"] });
+    const session = user.session({ id: "sid_one" });
+    await session.taskCoverage();
+    // The Session that answered is gone, so its excluded tasks don't carry into the new one.
+    await (await session.fetch(TASKS)).body?.cancel();
+    await session.taskCoverage();
+    expect(mock.requests.filter((r) => r.url === TASKS).length).toBeGreaterThan(1);
+  });
+
+  it("doesn't remember a tasks endpoint that failed", async () => {
+    const { session, mock } = await setup({ version: "0.4", tasksRateLimited: true });
+    await expect(session.taskCoverage()).resolves.toMatchObject({ excludedTasks: [] });
+    // A later call asks again rather than serving the failure for the rest of the Session.
+    await session.taskCoverage();
+    expect(mock.requests.filter((r) => r.url === TASKS).length).toBeGreaterThan(1);
+  });
+
+  it("reads 0.3 skills and feedback without fetching the excluded tasks document", async () => {
+    const { session, mock } = await setup({ version: "0.3", excludedTasksFails: true });
+    await expect(
+      session.sendFeedback({ task: "Pay with a gift card", description: "No API offered one." }),
+    ).resolves.toBeUndefined();
+    expect(mock.requests.some((r) => r.url === EXCLUDED_TASKS)).toBe(false);
+  });
+
+  it("keeps status on what close and handoff return", async () => {
+    const { session } = await setup({ version: "0.3" });
+    const { conversation } = await session.conversations().start({ text: "Hi" });
+    expect(await conversation.handoff()).toMatchObject({ status: expect.any(String) });
+    expect(await conversation.close()).toMatchObject({ status: expect.any(String) });
+  });
+
+  it("is working once the Company has accepted a request it hasn't answered", async () => {
+    // A 0.4 POST without wait answers with only conversation_id (spec 8.3), and the Company has
+    // work in progress from the moment it accepts (8.7).
+    const { session } = await setup({ version: "0.4" });
+    const { update } = await session.conversations().start({ text: "Hi" });
+    expect(update.working).toBe(true);
+  });
+
+  it("ignores a malformed scopes_supported on the domain's metadata", async () => {
+    const mock = await MockCompany.create({ version: "0.3" });
+    const agent = new PoppyAgent({
+      clientId: CLIENT_ID,
+      signingKey: { privateKey: mock.agentKey.privateKey, kid: "k1" },
+      fetch: ((input: string | URL | Request, init?: RequestInit) => {
+        const url = String(input instanceof Request ? input.url : input);
+        if (url === "https://example.com/.well-known/oauth-protected-resource")
+          return Promise.resolve(
+            Response.json({
+              resource: "https://example.com",
+              authorization_servers: ["https://auth.example.com"],
+              // 0.3 defines nothing here, so whatever a Company put in it can't refuse discovery.
+              scopes_supported: "orders:read",
+            }),
+          );
+        return mock.fetch(input, init);
+      }) as typeof fetch,
+    });
+    const company = await agent.discover("example.com");
+    expect(company.protocolVersion).toBe("0.3");
+    expect(company.resourceScopesSupported).toBeUndefined();
+  });
+
+  it("refuses a linked document on another port of the same host", async () => {
+    const { company } = await setup({
+      version: "0.3",
+      linkOtherVersion: true,
+      linkedUrl: "https://example.com:8443/poppy/other.json",
+    });
+    // Spec 3.4 says the host that served poppy.json, which a different port is not.
+    expect(company.protocolVersion).toBe("0.3");
+    expect(company.supportedVersions).toEqual({});
   });
 });

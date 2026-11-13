@@ -366,31 +366,25 @@ export class PoppyAgent {
   }
 
   /**
-   * Discovers a Company again, without a cached copy, and chooses a version again (spec 3.4). Its
-   * resolver is replaced too, since another version's document can list other endpoints.
+   * Discovers a Company again, without a cached copy, and chooses a version again (spec 3.4).
    *
-   * Keyed by version, so a Session that moves to another version doesn't hand its resolver to the
-   * `PoppyUser`s still holding the Company it discovered first: that resolver knows that version's
-   * endpoints, and would make the other version's destinations unreachable.
-   *
-   * The resolver is always built again, never taken from the cache. A cached one wraps the Company
-   * an earlier discovery found, and this is the one path whose whole purpose is to go past what was
-   * cached: reusing it would let `isDestination` accept an endpoint the Company's current document
-   * has dropped, and attach credentials to it (spec 5.2). It replaces the cached entry, so Sessions
-   * opened afterwards get the newest document rather than that earlier one. Holders of the old
-   * resolver keep it, which leaves each of them with the Company and resolver from one discovery
-   * rather than a mix of two; the only thing they don't share is an endpoint added later through
-   * `addExtensionEndpoint`, which a version change already discards.
+   * The resolver is always built from the document this call just read, and is NOT written to the
+   * shared cache. A cached one wraps the Company an earlier discovery found, and this is the one
+   * path whose purpose is to go past what was cached: reusing it would let `isDestination` accept an
+   * endpoint the Company's current document has dropped, and attach credentials to it (spec 5.2).
+   * Writing it back would be the same mistake pointing the other way — a rediscovery that keeps its
+   * version hands nothing to the Session, so a `PoppyUser` still holding the Company from before
+   * would be paired with a resolver built from a document it never saw, and its own listed APIs
+   * would stop resolving. Only the Session that adopts the new Company takes this resolver.
    */
   #rediscover(company: Company): Promise<Rediscovered> {
     return discover(company.domain, {
       fetch: this.#fetch,
       allowPrivateAddresses: this.#allowPrivate,
-    }).then((found) => {
-      const resolver = new ResourceResolver(found, this.#fetch, this.#allowPrivate);
-      this.#resolvers.set(this.#resolverKey(found), resolver);
-      return { company: found, resolver };
-    });
+    }).then((found) => ({
+      company: found,
+      resolver: new ResourceResolver(found, this.#fetch, this.#allowPrivate),
+    }));
   }
 
   /** @internal */
@@ -488,21 +482,44 @@ export class PoppyUser {
    * share this account's sign-in.
    *
    * Pass `id` to continue a Session this same User started, with the `sid` you saved from
-   * {@link Session.id}. A Session lasts until the agent stops using its `sid` (spec 5.5), so an agent
-   * that doesn't stay running keeps one Session rather than opening a new one for every command, and
-   * the Company sees the User's activity as the one Session it is. Only ever resume a `sid` under the
-   * User that started it: every Session JWT for a Session carries the same `sub` and Agent ID, and a
-   * Company rejects one that doesn't (spec 5.2, 5.3). If the Company has ended it, the next request
-   * gets `session_ended` and this SDK starts a new Session with a new `sid` on its own.
+   * {@link Session.id}, and `protocolVersion` with the {@link Session.protocolVersion} you saved
+   * beside it. A Session lasts until the agent stops using its `sid` (spec 5.5), so an agent that
+   * doesn't stay running keeps one Session rather than opening a new one for every command, and the
+   * Company sees the User's activity as the one Session it is.
+   *
+   * What a resumed `sid` needs:
+   *
+   * - The same User. Every Session JWT of a Session carries the same `sub` and Agent ID, and a
+   *   Company rejects one that doesn't (spec 5.2, 5.3). The `sub` is the pairwise User ID this agent
+   *   stores, so a process that starts with the default {@link MemoryStore} mints a new one and the
+   *   Company answers `invalid_session`: give {@link PoppyAgentOptions.store} a persistent store, and
+   *   the same `localUserId`. An anonymous User can't be resumed at all, and this throws if you try.
+   * - The same protocol version. A Session uses one version throughout (spec 3.4). Pass the version
+   *   you saved: if the Company now serves another one, a new Session starts instead of sending the
+   *   old `sid` under a version it never used. Compare {@link Session.id} with what you passed to
+   *   see which happened.
+   * - A Session that hasn't ended. Once the Company ends one, or you call {@link Session.end}, stop
+   *   using that `sid` (spec 5.5). If the Company has ended it, the next request gets `session_ended`
+   *   and this SDK starts a new Session with a new `sid` on its own.
    */
-  session(options: { id?: string } = {}): Session {
+  session(options: { id?: string; protocolVersion?: string } = {}): Session {
+    if (options.id !== undefined && this.anonymous)
+      throw new PoppyProtocolError(
+        "an anonymous User gets a new User ID each time, so its Session can't be resumed (spec 5.1)",
+      );
+    // A Session keeps one protocol version throughout (spec 3.4). When the Company now serves
+    // another one, the saved `sid` belongs to a Session that can't continue here, so a new one
+    // starts instead of sending that `sid` under a version it never used.
+    const resumable =
+      options.protocolVersion === undefined ||
+      options.protocolVersion === this.company.protocolVersion;
     return new Session({
       company: this.company,
       clientId: this.#agent.clientId,
       userId: this.userId,
       agentId: this.agentId,
       account: this.#init.account,
-      ...(options.id === undefined ? {} : { sid: options.id }),
+      ...(options.id === undefined || !resumable ? {} : { sid: options.id }),
       ...this.#sessionInit(),
     });
   }

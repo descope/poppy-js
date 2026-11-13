@@ -575,7 +575,7 @@ export function poppyTools(options: PoppyToolsOptions): PoppyTool[] {
           if (!(conversation instanceof Conversation)) return conversation;
           try {
             const state = await conversation.handoff();
-            return { conversation_id: conversation.id, status: conversation.status, ...state };
+            return { conversation_id: conversation.id, ...state };
           } catch (error) {
             return fromError(error);
           }
@@ -596,7 +596,7 @@ export function poppyTools(options: PoppyToolsOptions): PoppyTool[] {
           if (!(conversation instanceof Conversation)) return conversation;
           try {
             const state = await conversation.close();
-            return { conversation_id: conversation.id, status: conversation.status, ...state };
+            return { conversation_id: conversation.id, ...state };
           } catch (error) {
             return fromError(error);
           }

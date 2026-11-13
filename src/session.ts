@@ -1,7 +1,7 @@
 import type { Account } from "./account.ts";
 import { authChallenge } from "./challenge.ts";
 import { Conversations } from "./conversations.ts";
-import type { Company } from "./discovery.ts";
+import { type Company, companySupports } from "./discovery.ts";
 import { errorFromBody, errorFromResponse, PoppyError, PoppyProtocolError } from "./errors.ts";
 import { checkPublicHost, type Fetch, getJson, httpsUrl, isObject } from "./http.ts";
 import { randomId } from "./jose.ts";
@@ -77,7 +77,7 @@ export function extensionsHeader(
   const sfString = (value: string) =>
     /^[\x20-\x7e]*$/.test(value) ? `"${value.replace(/([\\"])/g, "\\$1")}"` : undefined;
   const declared = Object.entries(extensions).flatMap(([name, { version }]) => {
-    if (company.extensions[name]?.some((entry) => entry.version === version) !== true) return [];
+    if (!companySupports(company, name, version)) return [];
     const key = sfString(name);
     const value = sfString(version);
     return key === undefined || value === undefined ? [] : [`${key};v=${value}`];
@@ -110,8 +110,9 @@ export class Session {
   readonly #init: SessionInit;
   #sid: string;
   #ended = false;
-  #versionRetried = false;
   #coverage: Promise<TaskCoverage> | undefined;
+  /** The 0.4 feedback endpoint this Session was given, which belongs to it alone (spec section 9). */
+  #feedbackEndpoint: string | undefined;
 
   constructor(init: SessionInit) {
     this.#company = init.company;
@@ -181,7 +182,10 @@ export class Session {
     if (this.#ended) throw new PoppyProtocolError("this Session has ended");
     const url = httpsUrl(String(input), "request URL");
     checkPublicHost(url, "request URL", this.#init.allowPrivateAddresses);
-    if (!(await this.#resolver.isDestination(url)))
+    if (
+      `${url.origin}${url.pathname}` !== this.#feedbackEndpoint &&
+      !(await this.#resolver.isDestination(url))
+    )
       throw new PoppyProtocolError(
         `${url.origin}${url.pathname} is not an API or endpoint ${this.company.domain} lists`,
       );
@@ -197,6 +201,9 @@ export class Session {
     let sessionRetried = false;
     let tokenRetried = false;
     let nonceRetried = false;
+    // Per request, like the others: a Session that switched version once can still meet a Company
+    // that drops that version later, and has to choose again rather than failing from then on.
+    let versionRetried = false;
     for (;;) {
       const choice = account?.signedIn === true ? await this.#resolver.resolve(url) : undefined;
       const token =
@@ -263,17 +270,19 @@ export class Session {
         // A new Session, once. Its state doesn't carry over, but conversations do (spec 5.5).
         sessionRetried = true;
         this.#sid = randomId();
+        // A new Session: the old one's excluded tasks and feedback endpoint were its own (spec 9).
+        this.#coverage = undefined;
         await response.body?.cancel();
         continue;
       }
       if (
         response.status === 400 &&
-        !this.#versionRetried &&
+        !versionRetried &&
         (await sessionError(response, "version_unsupported"))
       ) {
         // The Company doesn't serve the version this Session uses. Discover it again, without a cached
         // copy, and choose again; a different version continues in a new Session (spec 3.4).
-        this.#versionRetried = true;
+        versionRetried = true;
         if (await this.#chooseVersionAgain()) {
           await response.body?.cancel();
           // The new version's document is a different document: it may list other endpoints, and a
@@ -408,7 +417,13 @@ export class Session {
    * carries on rather than failing over a document that only describes what the Company offers.
    */
   taskCoverage(): Promise<TaskCoverage> {
-    this.#coverage ??= this.#fetchCoverage().catch(() => EMPTY_COVERAGE);
+    // A failure isn't remembered: spec section 9 has the agent carry on as if the Company published
+    // nothing when it gets no answer, but a rate limit or a 5xx says nothing about the rest of the
+    // Session, and caching it would hide the Company's tasks until the Session ends.
+    this.#coverage ??= this.#fetchCoverage().catch(() => {
+      this.#coverage = undefined;
+      return EMPTY_COVERAGE;
+    });
     return this.#coverage;
   }
 
@@ -435,8 +450,7 @@ export class Session {
     const coverage = parseTaskCoverage(body, company, endpoint);
     // The feedback endpoint comes from this response rather than poppy.json, so it becomes a Session
     // destination only once the Company has named it (spec 5.2).
-    if (coverage.feedbackEndpoint !== undefined)
-      this.#resolver.addFeedbackEndpoint(coverage.feedbackEndpoint);
+    if (coverage.feedbackEndpoint !== undefined) this.#feedbackEndpoint = coverage.feedbackEndpoint;
     return coverage;
   }
 
@@ -455,7 +469,12 @@ export class Session {
    * token. The index comes from `poppy.json` on 0.3 and from this Session's task coverage on 0.4.
    */
   async fetchSkill(name: string): Promise<SkillArtifact> {
-    const { skills } = await this.taskCoverage();
+    // On 0.3 the index is in `poppy.json`, so this needs no request of its own; only 0.4 puts it
+    // behind `tasks.endpoint` (spec 9.4).
+    const skills =
+      this.company.protocolVersion === "0.3"
+        ? this.company.skills
+        : (await this.taskCoverage()).skills;
     const skill = skills.find((entry) => entry.name === name);
     if (skill === undefined)
       throw new PoppyProtocolError(`${this.company.domain} lists no skill ${name}`);
@@ -478,7 +497,11 @@ export class Session {
    * with an alternative if the Company says the task can be done after all, else undefined.
    */
   async sendFeedback(report: FeedbackReport): Promise<Alternative | undefined> {
-    const endpoint = (await this.taskCoverage()).feedbackEndpoint;
+    // Likewise, 0.3 names the feedback endpoint in `poppy.json` (spec 9.3).
+    const endpoint =
+      this.company.protocolVersion === "0.3"
+        ? this.company.feedbackEndpoint
+        : (await this.taskCoverage()).feedbackEndpoint;
     if (endpoint === undefined)
       throw new PoppyProtocolError(`${this.company.domain} has no feedback endpoint`);
     checkFeedback(report);

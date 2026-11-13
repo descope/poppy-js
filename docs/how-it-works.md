@@ -87,21 +87,27 @@ Two areas behave differently on each version, and the SDK gives you one API for 
 
 `agent.user(company, "your-own-user-id")` returns the User's **User ID** at that Company. The SDK generates it at random the first time and keeps it in your store, so it's stable, different at every Company, and not derived from anything personal (spec 5.1). The Company never sees your own user ID.
 
-`user.session()` opens a Session. It makes no request: the `sid` is yours to choose, and the Session starts at the Company when the first request carrying it arrives (spec 5.2). Run several at once for tasks in parallel; they share the account's sign-in.
+`user.session()` opens a Session. It makes no request: the SDK picks a random `sid`, and the Session starts at the Company when the first request carrying it arrives (spec 5.2). One Session belongs to one User at one Company, so a `sid` is never carried to another of either. Run several at once for tasks in parallel; they share the account's sign-in.
 
 ### Carrying a Session across processes
 
 A Session lasts until you stop using its `sid` (spec 5.5), not until a process exits. An agent that doesn't stay running — a CLI, a queue worker, a serverless handler — would otherwise open a new Session for every invocation, and the Company would see one User's activity as a crowd of unrelated Sessions, with the cart and the open conversation each belonging to one that never comes back.
 
-Save `session.id` and pass it back:
+Save `session.id` with the version it ran under, and pass both back:
 
 ```typescript
-const session = user.session({ id: savedSessionId });
+const session = user.session({ id: savedId, protocolVersion: savedVersion });
 // ... use it ...
-await save(session.id); // read it again after: it changes if the Company ended the Session
+await save(session.id, session.protocolVersion); // read both back: either can have changed
 ```
 
-Resume a `sid` only under the User that started it. Every Session JWT of a Session carries the same `sub` and Agent ID, and a Company rejects one that doesn't (spec 5.2, 5.3). If the Company has ended it, the next request gets `session_ended`, and the SDK starts a new Session with a new `sid` and sends the request again, once — so read `session.id` back after a request rather than assuming the one you passed in is still current.
+Three things a resumed `sid` needs, and the SDK can only check the last two:
+
+- **A persistent store and the same `localUserId`.** The Session JWT's `sub` is the pairwise User ID, which `PoppyAgent` keeps in its store — and the default store is `MemoryStore`, which a new process starts empty. A CLI that resumes a `sid` without a persistent `store` signs it under a different `sub`, and the Company answers `invalid_session` on every request. Give `PoppyAgent` a real store, and ask for the same User.
+- **The same protocol version.** A Session uses one version throughout (spec 3.4). Pass the version you saved: if the Company now serves another one, the SDK starts a new Session rather than sending the old `sid` under a version it never used. Compare `session.id` with what you passed to see which happened.
+- **A User that isn't anonymous.** `anonymousUser()` mints a new User ID every time, so there is nothing to continue; `session({ id })` throws there rather than letting the old `sid` go out under a new `sub`.
+
+If the Company has ended the Session, the next request gets `session_ended` and the SDK starts a new one with a new `sid` and sends the request again, once — so read `session.id` back after a request rather than assuming the one you passed in is still current. Once a Session has ended, on either side, stop using its `sid` (spec 5.5): don't pass it to `session({ id })` again.
 
 Every request to the Company's APIs, conversations and other protocol endpoints carries a `Poppy-Session` header: a JWT signed fresh for that one request (spec 5.2). Your signing key doesn't sign it directly. Instead, it signs a short-lived **delegation** that vouches for a **delegated key**, and the delegated key signs the Session JWTs.
 

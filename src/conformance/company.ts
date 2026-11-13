@@ -769,7 +769,10 @@ export class ConformanceCompany {
     // Extensions are declared per request from 0.4, not in the client metadata document (spec 3.3).
     const extensions = headers.get("poppy-extensions");
     if (extensions !== null) {
-      if (/^"[^"]+";v="[^"]+"(,\s*"[^"]+";v="[^"]+")*$/.test(extensions))
+      // Split first, then check each member: one pass over the value, with no nested quantifier for
+      // a crafted header to make backtrack (RFC 9651 section 4.2).
+      const members = extensions.split(",");
+      if (members.every((member) => /^\s*"[^"]+";v="[^"]+"\s*$/.test(member)))
         this.pass("extensions.declared");
       else
         this.fail("extensions.declared", `Poppy-Extensions isn't an RFC 9651 List: ${extensions}`);

@@ -41,12 +41,14 @@ export interface MockOptions {
   versionAfterError?: "0.3" | "0.4";
   /** The body the 0.4 tasks endpoint answers with (spec section 9). */
   tasks?: Record<string, unknown>;
+  /** The tasks endpoint rate-limits instead of answering, which says nothing about later calls. */
+  tasksRateLimited?: boolean;
   /** The 0.3 excluded tasks document answers 404, as a Company that moved it would. */
   excludedTasksFails?: boolean;
   /** Report `working: true` on the first events read of a conversation, then false. */
   workingFirstRead?: boolean;
-  /** Answer the first request of each Session with session_ended, as a Company that ended it does. */
-  sessionEndedOnce?: boolean;
+  /** Sids this Company has ended: the first request with one gets session_ended, a retry succeeds. */
+  endedSids?: string[];
   /** Token type the server issues; `DPoP` also requires a proof. */
   tokenType?: "Bearer" | "DPoP";
   /** Return a new refresh token on every refresh. */
@@ -230,6 +232,7 @@ export class MockCompany {
         if (this.options.excludedTasksFails === true) return json(404, { error: "not_found" });
         return json(200, { tasks: [{ task: "Send a wire transfer" }] });
       case TASKS:
+        if (this.options.tasksRateLimited === true) return json(429, { error: "rate_limited" });
         return this.#resource(url, method, headers, undefined, undefined, () =>
           json(
             200,
@@ -555,8 +558,9 @@ export class MockCompany {
     this.sessionClaims.push(payload);
     // A Company that ended this Session: the first request with each sid gets session_ended, so the
     // agent starts a new one with a new sid and sends the request again, once (spec 5.5).
-    if (this.options.sessionEndedOnce === true && !this.#endedSids.has(String(payload["sid"]))) {
-      this.#endedSids.add(String(payload["sid"]));
+    const sid = String(payload["sid"]);
+    if (this.options.endedSids?.includes(sid) === true && !this.#endedSids.has(sid)) {
+      this.#endedSids.add(sid);
       return json(400, { error: "session_ended" });
     }
 

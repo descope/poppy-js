@@ -463,7 +463,7 @@ export class Conversations {
     if (typeof id !== "string" || !ID.test(id))
       throw new PoppyProtocolError("the Company returned no valid conversation_id");
     const conversation = new Conversation(this, id, undefined, direct);
-    return { conversation, update: conversation.apply(response) };
+    return { conversation, update: conversation.apply(response, true) };
   }
 
   /** Sends a JSON request and returns the JSON body, throwing {@link PoppyError} on an error status. */
@@ -524,8 +524,8 @@ export class Conversation {
    * The conversation's state after the last response (spec 8.7): `working`, `handoff`, `responder` and
    * `closed`. On 0.3 these are derived from `status`.
    */
-  get state(): ConversationState {
-    return { ...this.#state };
+  get state(): ConversationState & { status: ConversationStatus } {
+    return { ...this.#state, status: statusFor(this.#state) };
   }
 
   /** The Company has work in progress. Read until it's false to get its whole reply (spec 8.7). */
@@ -567,7 +567,7 @@ export class Conversation {
   }
 
   /** Applies a response: handles new events in order and saves the cursor after them (spec 8.5). */
-  apply(response: Record<string, unknown>): ConversationUpdate {
+  apply(response: Record<string, unknown>, accepted = false): ConversationUpdate {
     const events: ConversationEvent[] = [];
     if (Array.isArray(response["events"])) {
       for (const raw of response["events"]) {
@@ -610,6 +610,10 @@ export class Conversation {
       if (response["responder"] !== undefined)
         this.#state.responder = normalizeResponder(response["responder"]);
     }
+    // A POST the Company accepted but whose reply carries no state: it has work in progress from the
+    // moment it accepts a request, so a caller doesn't read `working: false` and close too early.
+    if (accepted && response["status"] === undefined && typeof response["working"] !== "boolean")
+      this.#state.working = true;
     return {
       events,
       ...this.#state,
@@ -636,7 +640,7 @@ export class Conversation {
       wait: options.wait,
       cursor: options.wait === undefined ? undefined : this.#cursor,
     });
-    return this.apply(await this.#conversations.request("POST", url, body));
+    return this.apply(await this.#conversations.request("POST", url, body), true);
   }
 
   /**
@@ -687,13 +691,14 @@ export class Conversation {
    * Asks for a person at the Company (spec 8.9). The Company accepts the request and acts on it after
    * responding, so read until `working` is false to see `handoff` and `responder` settle.
    */
-  async handoff(options: { id?: string } = {}): Promise<ConversationState> {
+  async handoff(options: { id?: string } = {}): Promise<Conversation["state"]> {
     this.apply(
       await this.#conversations.request(
         "POST",
         `${this.#url}/handoff`,
         this.#idBody(options.id, "hnd_"),
       ),
+      true,
     );
     return this.state;
   }
@@ -703,7 +708,7 @@ export class Conversation {
    * and a person may join before it acts on the cancel, so read `handoff` and `responder` for the
    * outcome rather than depending on the cancel taking effect.
    */
-  async cancelHandoff(options: { id?: string } = {}): Promise<ConversationState> {
+  async cancelHandoff(options: { id?: string } = {}): Promise<Conversation["state"]> {
     if (this.#conversations.session.company.protocolVersion === "0.3")
       throw new PoppyProtocolError("withdrawing a handoff needs protocol version 0.4 or later");
     this.apply(
@@ -712,6 +717,7 @@ export class Conversation {
         `${this.#url}/handoff/cancel`,
         this.#idBody(options.id, "hnc_"),
       ),
+      true,
     );
     return this.state;
   }
@@ -722,7 +728,7 @@ export class Conversation {
    * From 0.4 a close doesn't wait its turn: the Company MAY act on requests it hasn't acted on yet, or
    * drop them, so read until `working` is false before closing to be sure it acted on everything sent.
    */
-  async close(options: { id?: string } = {}): Promise<ConversationState> {
+  async close(options: { id?: string } = {}): Promise<Conversation["state"]> {
     this.apply(
       await this.#conversations.request(
         "POST",

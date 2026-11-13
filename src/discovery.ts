@@ -244,7 +244,8 @@ function parseSupportedVersions(
   publishedVersion: string,
 ): Record<string, string> {
   if (!isObject(value)) return {};
-  const host = finalUrl.hostname.toLowerCase();
+  // `host`, not `hostname`: a document on another port is not on the host that served poppy.json.
+  const host = finalUrl.host.toLowerCase();
   const versions: Record<string, string> = {};
   for (const [version, url] of Object.entries(value)) {
     if (version === publishedVersion) continue;
@@ -256,7 +257,7 @@ function parseSupportedVersions(
       continue;
     }
     if (parsed.protocol !== "https:") continue;
-    if (parsed.hostname.toLowerCase() !== host) continue;
+    if (parsed.host.toLowerCase() !== host) continue;
     versions[version] = parsed.href;
   }
   return versions;
@@ -512,7 +513,11 @@ async function findIssuer(
     if (body["resource"] !== resource)
       throw new PoppyProtocolError(`protected resource metadata resource must be ${resource}`);
     servers = optionalStringList(body["authorization_servers"], "authorization_servers") ?? [];
-    scopesSupported = optionalStringList(body["scopes_supported"], "scopes_supported");
+    // 0.4 reads the domain's own scopes from here (spec 3.2, 4.7). 0.3 defines nothing here, and a
+    // Company may have put anything in it, so a malformed value is ignored rather than refused.
+    scopesSupported = Array.isArray(body["scopes_supported"])
+      ? body["scopes_supported"].filter((scope): scope is string => typeof scope === "string")
+      : undefined;
   }
   if (servers.length === 0) {
     if (authIssuer !== undefined)

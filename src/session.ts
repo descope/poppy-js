@@ -3,7 +3,15 @@ import { authChallenge } from "./challenge.ts";
 import { Conversations } from "./conversations.ts";
 import { type Company, companySupports } from "./discovery.ts";
 import { errorFromBody, errorFromResponse, PoppyError, PoppyProtocolError } from "./errors.ts";
-import { checkPublicHost, type Fetch, getJson, httpsUrl, isObject, isRedirect } from "./http.ts";
+import {
+  checkPublicHost,
+  type Fetch,
+  getJson,
+  httpsUrl,
+  isObject,
+  isRedirect,
+  originOf,
+} from "./http.ts";
 import { randomId } from "./jose.ts";
 import { type Approval, approvalHeader } from "./operations.ts";
 import { type OperatorSignatureOptions, signOperator } from "./operator.ts";
@@ -113,6 +121,8 @@ export class Session {
   #coverage: Promise<TaskCoverage> | undefined;
   /** The 0.4 feedback endpoint this Session was given, which belongs to it alone (spec section 9). */
   #feedbackEndpoint: string | undefined;
+  /** Bumped whenever coverage is dropped, so a request from before then can't write its answer back. */
+  #coverageGeneration = 0;
 
   /**
    * Drops everything a tasks response taught this Session. The feedback endpoint goes with the
@@ -122,6 +132,8 @@ export class Session {
   #forgetCoverage(): void {
     this.#coverage = undefined;
     this.#feedbackEndpoint = undefined;
+    // Anything already in flight belongs to the Session that asked for it, not to this one.
+    this.#coverageGeneration++;
   }
 
   constructor(init: SessionInit) {
@@ -198,17 +210,25 @@ export class Session {
     if (this.#ended) throw new PoppyProtocolError("this Session has ended");
     const start = httpsUrl(String(input), "page URL");
     checkPublicHost(start, "page URL", this.#init.allowPrivateAddresses);
-    const method = (init.method ?? "GET").toUpperCase();
+    // Headers and a body belong to the origin the caller addressed. `rest` is the request options
+    // that carry nothing about this Company, such as `signal`, and travel with every hop.
+    const { headers: callerHeaders, body: callerBody, method: callerMethod, ...rest } = init;
+    let method = (callerMethod ?? "GET").toUpperCase();
+    let body = callerBody;
     let url = start;
     let withoutHeader = false;
     for (let hop = 0; hop <= MAX_PAGE_REDIRECTS; hop++) {
-      const headers = new Headers(init.headers);
+      // Once a redirect leaves the origin the caller addressed, that origin's headers and body stop
+      // travelling, as they do in `fetch`: a page can otherwise send a Cookie or an API key of the
+      // caller's to any host it names.
+      const sameOrigin = url.origin === start.origin;
+      const headers = new Headers(sameOrigin ? callerHeaders : undefined);
       headers.delete("authorization");
-      // Only this Company's own host, and only from 0.4, which is where the rule begins.
+      // This Company's own origin, port included, and only from 0.4 where the rule begins.
       const signed =
         !withoutHeader &&
         this.protocolVersion !== "0.3" &&
-        url.hostname.toLowerCase() === this.company.domain;
+        url.origin === originOf(this.company.domain);
       if (signed) {
         headers.set(
           "poppy-session",
@@ -228,18 +248,27 @@ export class Session {
         if (this.#extensionsHeader !== undefined)
           headers.set("poppy-extensions", this.#extensionsHeader);
       }
-      if (this.#init.operator !== undefined)
+      // The operator signature goes with the Session header (spec 5.3), so a host a page redirects
+      // to doesn't receive a signature made for its own authority under this operator's key.
+      if (signed && this.#init.operator !== undefined)
         await signOperator(this.#init.operator, url, headers, method);
       const response = await this.#init.fetch(url, {
-        ...init,
+        ...rest,
         method,
         headers,
+        ...(body === undefined || !sameOrigin ? {} : { body }),
         redirect: "manual",
       });
       if (isRedirect(response)) {
         const location = response.headers.get("location");
         if (location === null) return response;
         await response.body?.cancel();
+        // 301, 302 and 303 make the next request a GET with no body, as `fetch` does, so a form
+        // POST isn't repeated against whatever the page redirected to.
+        if ([301, 302, 303].includes(response.status) && method !== "GET" && method !== "HEAD") {
+          method = "GET";
+          body = undefined;
+        }
         url = httpsUrl(new URL(location, url).href, "page redirect");
         checkPublicHost(url, "page redirect", this.#init.allowPrivateAddresses);
         continue;
@@ -509,14 +538,18 @@ export class Session {
     // A failure isn't remembered: spec section 9 has the agent carry on as if the Company published
     // nothing when it gets no answer, but a rate limit or a 5xx says nothing about the rest of the
     // Session, and caching it would hide the Company's tasks until the Session ends.
-    this.#coverage ??= this.#fetchCoverage().catch(() => {
-      this.#forgetCoverage();
-      return EMPTY_COVERAGE;
-    });
+    if (this.#coverage === undefined) {
+      const generation = this.#coverageGeneration;
+      this.#coverage = this.#fetchCoverage(generation).catch(() => {
+        // Only this request's own failure is forgotten: a newer one may already have an answer.
+        if (generation === this.#coverageGeneration) this.#forgetCoverage();
+        return EMPTY_COVERAGE;
+      });
+    }
     return this.#coverage;
   }
 
-  async #fetchCoverage(): Promise<TaskCoverage> {
+  async #fetchCoverage(generation: number): Promise<TaskCoverage> {
     const company = this.company;
     if (company.protocolVersion === "0.3") {
       // Only the excluded tasks need a request on 0.3: the skills and the feedback endpoint are
@@ -539,7 +572,10 @@ export class Session {
     const coverage = parseTaskCoverage(body, company, endpoint);
     // The feedback endpoint comes from this response rather than poppy.json, so it becomes a Session
     // destination only once the Company has named it (spec 5.2).
-    if (coverage.feedbackEndpoint !== undefined) this.#feedbackEndpoint = coverage.feedbackEndpoint;
+    // A Session that ended, or moved version, while this was in flight has already forgotten its
+    // coverage; this answer belonged to that one, so it must not become this Session's destination.
+    if (coverage.feedbackEndpoint !== undefined && generation === this.#coverageGeneration)
+      this.#feedbackEndpoint = coverage.feedbackEndpoint;
     return coverage;
   }
 

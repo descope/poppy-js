@@ -1097,7 +1097,7 @@ export class ConformanceCompany {
    * A page of the Company's website. From 0.4 an agent that fetches one with its own HTTP client
    * sends the Session header and never a token, so the request is signed out (5.2).
    */
-  #page({ method, url, headers }: Recorded): Response {
+  async #page({ method, url, headers }: Recorded): Promise<Response> {
     const jwt = headers.get("poppy-session");
     if (headers.has("authorization")) {
       this.fail("web.page-signed-out", "sent an access token with a website page request");
@@ -1115,8 +1115,14 @@ export class ConformanceCompany {
       this.#pageRefused = true;
       return json(400, { error: "invalid_session" });
     }
-    const decoded = safeDecode(jwt);
-    if (decoded?.payload["ath"] !== undefined)
+    // The same verification a resource gets: signature, delegation, claims, htm and htu. A header
+    // that doesn't verify is not a Session header, and an agent sending one isn't conformant.
+    const session = await this.#verifySession(jwt, method, url);
+    if (session === undefined) {
+      this.fail("web.page-session", "a page's Session header didn't verify");
+      return json(400, { error: "invalid_session" });
+    }
+    if (session.payload["ath"] !== undefined)
       this.fail("web.page-signed-out", "a page's Session JWT carried ath");
     else this.pass("web.page-session");
     return html();
@@ -1293,8 +1299,10 @@ export class ConformanceCompany {
       if (rest[2] !== undefined && rest[2] !== "cancel") return json(404, { error: "not_found" });
       if (isV4 && checkRequestId() === undefined) return json(400, { error: "invalid_request" });
       if (rest[2] === "cancel") {
+        if (this.#handoff === "pending") this.pass("conversation.handoff-cancel");
+        else
+          this.fail("conversation.handoff-cancel", "withdrew a handoff that was never asked for");
         this.#handoff = "none";
-        this.pass("conversation.handoff-cancel");
       } else this.#handoff = "pending";
       return json(
         202,

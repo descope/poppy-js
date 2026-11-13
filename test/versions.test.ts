@@ -790,29 +790,38 @@ describe("review round two (PR #15)", () => {
 });
 
 describe("a Session forgets what the last one was told (spec 5.2, 9)", () => {
+  // The 0.4 tasks response names a feedback endpoint of its own, which no 0.3 document lists, so
+  // whether it is still a destination says exactly whether the reset happened.
+  const V4_FEEDBACK = `${API}/poppy/feedback-v4`;
+
   it("stops treating the old feedback endpoint as a destination after session_ended", async () => {
-    const { user, mock } = await setup({ version: "0.4", endedSids: ["sid_one"] });
-    const session = user.session({ id: "sid_one" });
-    // The tasks response names the feedback endpoint, which becomes this Session's destination.
-    expect((await session.taskCoverage()).feedbackEndpoint).toBe(FEEDBACK);
-    // That Session is gone; the endpoint it named goes with it.
-    await (await session.fetch(TASKS)).body?.cancel();
+    const { user, mock } = await setup({
+      version: "0.4",
+      tasks: { feedback: { endpoint: V4_FEEDBACK } },
+    });
+    const session = user.session();
+    // Stored under a live sid, so there is something to lose.
+    expect((await session.taskCoverage()).feedbackEndpoint).toBe(V4_FEEDBACK);
+    // Now the Company ends that Session, and its next answer names no feedback endpoint.
+    mock.options.endedSids = [session.id];
     mock.options.tasks = { excluded_tasks: [] };
-    await expect(
-      session.sendFeedback({ task: "Pay with a gift card", description: "No API offered one." }),
-    ).rejects.toThrow(/has no feedback endpoint/);
+    await (await session.fetch(TASKS)).body?.cancel();
+    await expect(session.fetch(V4_FEEDBACK)).rejects.toThrow(/is not an API or endpoint/);
   });
 
   it("stops treating it as a destination after a version switch", async () => {
-    const { session } = await setup({
+    const { user, mock } = await setup({
       version: "0.4",
-      versionUnsupported: true,
-      versionAfterError: "0.3",
+      tasks: { feedback: { endpoint: V4_FEEDBACK } },
     });
-    await session.taskCoverage();
+    const session = user.session();
+    expect((await session.taskCoverage()).feedbackEndpoint).toBe(V4_FEEDBACK);
+    mock.options.versionUnsupported = true;
+    mock.options.versionAfterError = "0.3";
     await (await session.fetch(`${API}/v1/orders`)).body?.cancel();
     expect(session.protocolVersion).toBe("0.3");
-    // 0.3 names its own feedback endpoint in poppy.json; the 0.4 answer is not carried over.
+    // 0.3 names its own endpoint in poppy.json; the one the 0.4 answer named is gone.
+    await expect(session.fetch(V4_FEEDBACK)).rejects.toThrow(/is not an API or endpoint/);
     expect((await session.taskCoverage()).feedbackEndpoint).toBe(FEEDBACK);
   });
 });
@@ -846,7 +855,7 @@ describe("website pages fetched without a browser (spec 5.2, 5.6)", () => {
   it("drops the header on a hop that leaves the Company's domain", async () => {
     const { session, mock } = await setup({ version: "0.4" });
     await (await session.fetchPage(`https://example.com/offsite`)).body?.cancel();
-    const away = mock.requests.find((r) => r.url.startsWith("https://elsewhere.test"));
+    const away = mock.requests.find((r) => new URL(r.url).host === "elsewhere.test");
     expect(away).toBeDefined();
     expect(away?.headers.get("poppy-session")).toBeNull();
   });

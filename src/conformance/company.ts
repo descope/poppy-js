@@ -18,6 +18,15 @@ export const CONVERSATIONS = `${ORIGIN}/poppy/conversations`;
 /** Where a 0.4 Company serves a Session's excluded tasks, skills and feedback endpoint (spec 9). */
 export const TASKS = `${ORIGIN}/poppy/tasks`;
 export const FEEDBACK = `${ORIGIN}/poppy/feedback`;
+/** Where the agent's own browser joins a Session (spec section 6). */
+export const BROWSER_SESSION = `${ORIGIN}/poppy/browser-session`;
+/** A page of the Company's website, which 0.4 has an agent fetch with the Session header (5.2). */
+export const PAGE = `${ORIGIN}/help/returns`;
+/** The one skill the Company publishes, and the bytes its digest covers (spec 9.4). */
+export const SKILL_URL = `${ORIGIN}/skills/returns/SKILL.md`;
+export const SKILL_BODY = "# Returns\n\nAsk the Company Agent, then call the exchanges API.\n";
+/** The scope a signed-in browser join needs, from 0.4 (spec 4.7, section 6). */
+const BROWSER_SIGN_IN = "poppy:browser-sign-in";
 /** Where this Company serves the document for the version it doesn't prefer (spec 3.4). */
 const OTHER_VERSION_DOC = `${ORIGIN}/poppy/other-version.json`;
 const TOKEN = `${ORIGIN}/oauth/token`;
@@ -41,6 +50,12 @@ export interface Scenario {
   linkedVersionMismatch?: boolean;
   /** Every request with the Session header is refused with version_unsupported. */
   versionUnsupported?: boolean;
+  /** The conversation refuses everything with version_mismatch, as one started elsewhere would. */
+  versionMismatch?: boolean;
+  /** The Company Agent keeps working over the first read of a conversation, then stops. */
+  slowAgent?: boolean;
+  /** A website page refuses the Session header once, so the agent asks again without it. */
+  pageRejectsSession?: boolean;
   /** www.shop.test redirects poppy.json to an uploaded file. */
   redirectToUpload?: boolean;
   /** organization.domain names another host. */
@@ -89,6 +104,13 @@ function json(status: number, body: unknown, headers: Record<string, string> = {
   return new Response(JSON.stringify(body), {
     status,
     headers: { "content-type": "application/json", ...headers },
+  });
+}
+
+function html(): Response {
+  return new Response("<html>ok</html>", {
+    status: 200,
+    headers: { "content-type": "text/html" },
   });
 }
 
@@ -150,6 +172,14 @@ export class ConformanceCompany {
   readonly #sidIds = new Map<string, string>();
   readonly #endedSids = new Set<string>();
   readonly #sidVersions = new Map<string, string>();
+  #browserCode: string | undefined;
+  #signInRefused = false;
+  #codeIssued = false;
+  #codeAuthorized = false;
+  #pageRefused = false;
+  #handoff: "none" | "pending" = "none";
+  #reads = 0;
+  #mismatches = 0;
   #sessionErrors = 0;
   #versionErrors = 0;
   readonly #codes = new Map<string, { challenge: string; scope: string[]; redirectUri: string }>();
@@ -277,6 +307,7 @@ export class ConformanceCompany {
         ? {
             feedback: { endpoint: FEEDBACK },
             excluded_tasks: { url: `${ORIGIN}/poppy/excluded-tasks.json` },
+            skill_index: this.skillIndex(),
           }
         : { tasks: { endpoint: TASKS } };
     return {
@@ -286,9 +317,16 @@ export class ConformanceCompany {
         domain: this.scenario.wrongDomain ? "other.test" : "shop.test",
       },
       auth: {
-        scopes: { "orders:read": "See your orders", "orders:write": "Change your orders" },
+        scopes: {
+          "orders:read": "See your orders",
+          "orders:write": "Change your orders",
+          ...(version === "0.3"
+            ? {}
+            : { [BROWSER_SIGN_IN]: "Use the website signed in, with the access you approve" }),
+        },
         scope_hints: { "orders:read": { changes: "none", personal_data: true } },
       },
+      web: { browser_session_endpoint: BROWSER_SESSION },
       agent: { protocols: [{ type: "poppy", endpoint: CONVERSATIONS }] },
       apis: [
         { type: "openapi", url: `${ORIGIN}/openapi.json`, description: "Orders" },
@@ -302,6 +340,22 @@ export class ConformanceCompany {
       extensions: {
         operations: version === "0.3" ? { version: "2" } : [{ version: "2" }],
       },
+    };
+  }
+
+  /** The Agent Skills index this Company publishes, with the digest of the bytes it serves (9.4). */
+  skillIndex(): Record<string, unknown> {
+    return {
+      $schema: "https://schemas.agentskills.io/discovery/0.2.0/schema.json",
+      skills: [
+        {
+          name: "returns",
+          description: "How to return an item with this Company.",
+          type: "skill-md",
+          url: SKILL_URL,
+          digest: "sha256:f6d76ac5292b338b8a3bb4d4dbd7ca660c3f43068a15ad5e5c2de4d950ed916f",
+        },
+      ],
     };
   }
 
@@ -332,7 +386,7 @@ export class ConformanceCompany {
       revocation_endpoint: REVOKE,
       authorization_endpoint: AUTHORIZE,
       grant_types_supported: ["refresh_token", "authorization_code"],
-      scopes_supported: ["orders:read", "orders:write"],
+      scopes_supported: ["orders:read", "orders:write", BROWSER_SIGN_IN],
       protected_resources: this.scenario.issuerUnlinked ? [MCP] : [ORIGIN, MCP],
       ...(this.scenario.dpop ? { dpop_signing_alg_values_supported: ["ES256"] } : {}),
     };
@@ -371,13 +425,39 @@ export class ConformanceCompany {
         return json(200, { tasks: [{ task: "Send a wire transfer" }] });
       case TASKS:
         return this.#resource(request, undefined, undefined, () => this.#tasks(request));
-      case FEEDBACK:
-        return this.#resource(
-          request,
-          undefined,
-          undefined,
-          () => new Response(null, { status: 202 }),
+      case SKILL_URL:
+        // A skill artifact is Company content: it carries no credential, wherever it lives (9.4).
+        if (headers.has("poppy-session") || headers.has("authorization"))
+          this.fail("tasks.skill-digest", "sent a credential when fetching a skill artifact");
+        else this.pass("tasks.skill-digest");
+        return new Response(SKILL_BODY, {
+          status: 200,
+          headers: { "content-type": "text/markdown" },
+        });
+      case BROWSER_SESSION:
+        // Step 1: the agent's own browser loads the page and gets a one-time code (section 6).
+        this.#browserCode = `bc_${++this.#counter}`;
+        this.#codeIssued = true;
+        return new Response(
+          `<form method="POST" action="${BROWSER_SESSION}/submit"><input type="hidden" name="code" value="${this.#browserCode}"></form>`,
+          { status: 200, headers: { "content-type": "text/html" } },
         );
+      case `${BROWSER_SESSION}/authorize`:
+        return this.#resource(request, undefined, undefined, () => this.#authorizeBrowser(request));
+      case `${BROWSER_SESSION}/submit`:
+        if (!this.#codeAuthorized)
+          this.fail("browser.join", "submitted the form before authorizing the code");
+        else this.pass("browser.join");
+        return new Response(null, { status: 303, headers: { location: ORIGIN } });
+      case PAGE:
+        return this.#page(request);
+      case FEEDBACK:
+        return this.#resource(request, undefined, undefined, () => {
+          if (headers.has("authorization"))
+            this.fail("tasks.feedback", "sent an access token with a feedback report");
+          else this.pass("tasks.feedback");
+          return new Response(null, { status: 202 });
+        });
       case `${ORIGIN}/.well-known/oauth-protected-resource`:
         if (this.scenario.resourceMetadataFails) return json(500, { error: "unavailable" });
         return json(200, { resource: ORIGIN, authorization_servers: [ISSUER] });
@@ -923,6 +1003,15 @@ export class ConformanceCompany {
     else this.pass("versions.selection");
   }
 
+  /** Called by the runner after a version_mismatch scenario (spec 8.13). */
+  checkVersionMismatch(): void {
+    if (this.#mismatches === 0) return;
+    // The conversation can't continue in these versions, so an agent stops rather than hammering it.
+    if (this.#mismatches > 2)
+      this.fail("conversation.version-mismatch", "kept sending after version_mismatch");
+    else this.pass("conversation.version-mismatch");
+  }
+
   /** Called by the runner after a version_unsupported scenario (spec 3.4). */
   checkVersionErrors(): void {
     // The Company serves no version the agent can use, so it fetches poppy.json again, finds the same
@@ -957,6 +1046,80 @@ export class ConformanceCompany {
         this.fail("session.invalid-session", "sent the request again after invalid_session");
       else if (this.#sessionErrors === 1) this.pass("session.invalid-session");
     }
+  }
+
+  // ---------- Browser join and website pages ----------
+
+  /**
+   * Step 2 of a browser join (section 6): the agent authorizes the code its own browser was given,
+   * with the Session header and, if signed in, its access token.
+   *
+   * From 0.4 a signed-in join needs `poppy:browser-sign-in`, and a token without it is refused with
+   * `insufficient_scope` — the agent then joins signed out, or asks for the scope and starts again.
+   */
+  #authorizeBrowser({ body, headers }: Recorded): Response {
+    let code: unknown;
+    try {
+      code = (JSON.parse(body || "{}") as Record<string, unknown>)["code"];
+    } catch {
+      return json(400, { error: "invalid_request" });
+    }
+    // A code the agent did not read from its own browser's page.
+    if (typeof code !== "string" || !this.#codeIssued || code !== this.#browserCode) {
+      this.fail(
+        "browser.code-source",
+        `authorized a code this browser was never given: ${String(code)}`,
+      );
+      return json(400, { error: "invalid_request" });
+    }
+    this.pass("browser.code-source");
+    const token = headers.get("authorization")?.split(" ")[1];
+    if (token !== undefined && this.version !== "0.3") {
+      const issued = this.#access.get(token);
+      if (issued?.scope.includes(BROWSER_SIGN_IN) !== true) {
+        this.#signInRefused = true;
+        return challenge(
+          "Bearer",
+          `error="insufficient_scope", scope="${BROWSER_SIGN_IN}"`,
+          undefined,
+        );
+      }
+      this.pass("browser.sign-in-scope");
+    } else if (this.version !== "0.3" && this.#signInRefused) {
+      // It came back without a token after the refusal, which is one of the two allowed answers.
+      this.pass("browser.sign-in-scope");
+    }
+    this.#codeAuthorized = true;
+    return new Response(null, { status: 204 });
+  }
+
+  /**
+   * A page of the Company's website. From 0.4 an agent that fetches one with its own HTTP client
+   * sends the Session header and never a token, so the request is signed out (5.2).
+   */
+  #page({ method, url, headers }: Recorded): Response {
+    const jwt = headers.get("poppy-session");
+    if (headers.has("authorization")) {
+      this.fail("web.page-signed-out", "sent an access token with a website page request");
+      return json(400, { error: "invalid_session" });
+    }
+    this.pass("web.page-signed-out");
+    if (this.version === "0.3") return html();
+    if (jwt === null) {
+      // Allowed only as the second try, after this Company refused the header once (5.2, 5.6).
+      if (this.#pageRefused) this.pass("web.page-session");
+      else this.fail("web.page-session", `no Session header on ${method} ${url.pathname}`);
+      return html();
+    }
+    if (this.scenario.pageRejectsSession === true && !this.#pageRefused) {
+      this.#pageRefused = true;
+      return json(400, { error: "invalid_session" });
+    }
+    const decoded = safeDecode(jwt);
+    if (decoded?.payload["ath"] !== undefined)
+      this.fail("web.page-signed-out", "a page's Session JWT carried ath");
+    else this.pass("web.page-session");
+    return html();
   }
 
   // ---------- Task coverage ----------
@@ -1027,6 +1190,10 @@ export class ConformanceCompany {
       return json(400, { error: "invalid_request" });
     }
     const isV4 = this.version !== "0.3";
+    if (this.scenario.versionMismatch === true && rest.length > 0) {
+      this.#mismatches++;
+      return json(409, { error: "version_mismatch", protocol_version: "0.3" });
+    }
     const message = payload["message"] as Record<string, unknown> | undefined;
     /**
      * Checks the ID a POST carries (spec 8.2, 8.3). On 0.3 the message carries its own; from 0.4 the
@@ -1080,10 +1247,11 @@ export class ConformanceCompany {
       },
     });
     // 0.3 reports one status; 0.4 reports four independent fields (spec 8.7).
+    const working = this.scenario.slowAgent === true && this.#reads === 0;
     const state = (closed = false) =>
       isV4
-        ? { working: false, handoff: "none", responder: "agent", closed }
-        : { status: closed ? "closed" : "idle", responder: "agent" };
+        ? { working, handoff: this.#handoff, responder: "agent", closed }
+        : { status: closed ? "closed" : working ? "working" : "idle", responder: "agent" };
     if (rest.length === 0 && method === "POST") {
       if (!checkMessage()) return json(400, { error: "invalid_request" });
       const id = `cnv_${++this.#counter}`;
@@ -1102,6 +1270,11 @@ export class ConformanceCompany {
       );
     }
     if (rest[1] === "events" && method === "GET") {
+      if (this.scenario.slowAgent === true) {
+        // A second read means the agent didn't stop while the Company still had work (8.7).
+        if (this.#reads > 0) this.pass("conversation.working");
+        this.#reads++;
+      }
       const cursor = url.searchParams.get("cursor");
       const start =
         cursor === null ? 0 : conversation.events.findIndex((e) => e["id"] === cursor) + 1;
@@ -1119,6 +1292,10 @@ export class ConformanceCompany {
       if (rest[2] === "cancel" && !isV4) return json(404, { error: "not_found" });
       if (rest[2] !== undefined && rest[2] !== "cancel") return json(404, { error: "not_found" });
       if (isV4 && checkRequestId() === undefined) return json(400, { error: "invalid_request" });
+      if (rest[2] === "cancel") {
+        this.#handoff = "none";
+        this.pass("conversation.handoff-cancel");
+      } else this.#handoff = "pending";
       return json(
         202,
         isV4 ? { conversation_id: rest[0] } : { status: "queued", responder: "agent" },

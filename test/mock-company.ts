@@ -43,6 +43,8 @@ export interface MockOptions {
   tasks?: Record<string, unknown>;
   /** The tasks endpoint rate-limits instead of answering, which says nothing about later calls. */
   tasksRateLimited?: boolean;
+  /** A website page refuses the Session header once with invalid_session (spec 5.2). */
+  pageRejectsSession?: boolean;
   /** The 0.3 excluded tasks document answers 404, as a Company that moved it would. */
   excludedTasksFails?: boolean;
   /** Report `working: true` on the first events read of a conversation, then false. */
@@ -305,6 +307,24 @@ export class MockCompany {
           },
         });
       }
+      // Website pages, which 0.4 has an agent fetch with the Session header and no token (spec 5.2).
+      case `https://${DOMAIN}/help/returns`: {
+        if (this.options.pageRejectsSession === true && headers.has("poppy-session")) {
+          this.options.pageRejectsSession = false;
+          return json(400, { error: "invalid_session" });
+        }
+        if (headers.has("authorization"))
+          return json(400, { error: "invalid_session", error_description: "token on a page" });
+        return new Response("<html>returns</html>", {
+          status: 200,
+          headers: { "content-type": "text/html" },
+        });
+      }
+      case `https://${DOMAIN}/offsite`:
+        return new Response(null, {
+          status: 302,
+          headers: { location: "https://elsewhere.test/page" },
+        });
       default:
         if (here.startsWith(CONVERSATIONS))
           return this.#resource(url, method, headers, undefined, undefined, () =>

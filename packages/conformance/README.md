@@ -115,7 +115,7 @@ Each scenario writes `results/<scenario>-<timestamp>/`:
 The CLI then prints a line per check, across every scenario:
 
 ```text
-Personal Agent Protocol 0.4 and 0.3 conformance: 38 passed, 0 failed, 2 skipped
+Personal Agent Protocol 0.4 and 0.3 conformance: 48 passed, 0 failed, 2 skipped
 SKIP  MUST   4.1           identity.metadata
 PASS  MUST   3             discovery.well-known-path
 ...

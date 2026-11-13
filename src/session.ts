@@ -3,7 +3,7 @@ import { authChallenge } from "./challenge.ts";
 import { Conversations } from "./conversations.ts";
 import { type Company, companySupports } from "./discovery.ts";
 import { errorFromBody, errorFromResponse, PoppyError, PoppyProtocolError } from "./errors.ts";
-import { checkPublicHost, type Fetch, getJson, httpsUrl, isObject } from "./http.ts";
+import { checkPublicHost, type Fetch, getJson, httpsUrl, isObject, isRedirect } from "./http.ts";
 import { randomId } from "./jose.ts";
 import { type Approval, approvalHeader } from "./operations.ts";
 import { type OperatorSignatureOptions, signOperator } from "./operator.ts";
@@ -174,6 +174,85 @@ export class Session {
   /** Stops using this Session's `sid` (spec 5.5). The account stays signed in. */
   end(): void {
     this.#ended = true;
+  }
+
+  /**
+   * Fetches a page of the Company's website with this agent's own HTTP client, rather than a browser
+   * (spec 5.2, section 6). From 0.4 the request carries the Session header, so the Company can tell
+   * which Personal Agent and Session it is from, and never an access token, so it is always signed
+   * out even when a browser joined to this Session is signed in.
+   *
+   * The header goes only to HTTPS URLs whose host is exactly `organization.domain`. Redirects are
+   * followed, and each hop is signed again only while the host is still that domain; a hop that
+   * leaves it is followed without the header. On `invalid_session` the page is fetched once more
+   * without the header, which is the one case where leaving it out is allowed (spec 5.6).
+   *
+   * On 0.3 no header is sent at all: that version has website pages carry none, and an agent browses
+   * as any visitor would. A headless browser is a browser, so it joins the Session through
+   * {@link joinBrowser} instead of coming through here.
+   */
+  async fetchPage(
+    input: string | URL,
+    init: Omit<RequestInit, "redirect"> = {},
+  ): Promise<Response> {
+    if (this.#ended) throw new PoppyProtocolError("this Session has ended");
+    const start = httpsUrl(String(input), "page URL");
+    checkPublicHost(start, "page URL", this.#init.allowPrivateAddresses);
+    const method = (init.method ?? "GET").toUpperCase();
+    let url = start;
+    let withoutHeader = false;
+    for (let hop = 0; hop <= MAX_PAGE_REDIRECTS; hop++) {
+      const headers = new Headers(init.headers);
+      headers.delete("authorization");
+      // Only this Company's own host, and only from 0.4, which is where the rule begins.
+      const signed =
+        !withoutHeader &&
+        this.protocolVersion !== "0.3" &&
+        url.hostname.toLowerCase() === this.company.domain;
+      if (signed) {
+        headers.set(
+          "poppy-session",
+          await signSessionJwt(this.#init.keys, {
+            clientId: this.#init.clientId,
+            audience: this.company.identifier,
+            sid: this.#sid,
+            userId: this.userId,
+            agentId: this.agentId,
+            method,
+            url,
+            // Never a token on a website page, so the JWT carries no `ath` (spec 5.2).
+            accessToken: undefined,
+          }),
+        );
+        headers.set("poppy-version", this.protocolVersion);
+        if (this.#extensionsHeader !== undefined)
+          headers.set("poppy-extensions", this.#extensionsHeader);
+      }
+      if (this.#init.operator !== undefined)
+        await signOperator(this.#init.operator, url, headers, method);
+      const response = await this.#init.fetch(url, {
+        ...init,
+        method,
+        headers,
+        redirect: "manual",
+      });
+      if (isRedirect(response)) {
+        const location = response.headers.get("location");
+        if (location === null) return response;
+        await response.body?.cancel();
+        url = httpsUrl(new URL(location, url).href, "page redirect");
+        checkPublicHost(url, "page redirect", this.#init.allowPrivateAddresses);
+        continue;
+      }
+      // The Company says this header is wrong, so the page is asked for once more without it.
+      if (signed && response.status === 400 && (await sessionError(response, "invalid_session"))) {
+        withoutHeader = true;
+        await response.body?.cancel();
+        continue;
+      }
+      return response;
+    }
+    throw new PoppyProtocolError(`page redirected more than ${MAX_PAGE_REDIRECTS} times`);
   }
 
   /**
@@ -532,6 +611,9 @@ export class Session {
     throw await throwable(response);
   }
 }
+
+/** How many redirects a website page may take before this agent gives up (spec 5.2). */
+const MAX_PAGE_REDIRECTS = 5;
 
 const EMPTY_COVERAGE: TaskCoverage = {
   excludedTasks: [],

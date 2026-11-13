@@ -30,6 +30,14 @@ export interface AgentDriver {
   taskCoverage?(): Promise<void>;
   /** Reports a task the User couldn't do, to the feedback endpoint the Company names. */
   reportTask?(report: { task: string; description: string }): Promise<void>;
+  /** Joins the agent's OWN browser to the Session (section 6), never the User's. */
+  joinBrowser?(): Promise<void>;
+  /** Fetches a page of the Company's website with the agent's own HTTP client (5.2). */
+  fetchPage?(url: string): Promise<void>;
+  /** Starts a conversation, asks for a person, then withdraws the request (8.9). */
+  handoffThenCancel?(text: string): Promise<void>;
+  /** Fetches one of the Company's skills and checks it against its digest (9.4). */
+  readSkill?(name: string): Promise<void>;
 }
 
 /** Makes a fresh agent, with no state, that sends all of its HTTP through `fetch`. */
@@ -160,6 +168,19 @@ async function runStep(
     case "report_task":
       if (driver.reportTask === undefined) throw new Error("the driver has no reportTask()");
       return driver.reportTask({ task: step.task, description: step.description });
+    case "join_browser":
+      if (driver.joinBrowser === undefined) throw new Error("the driver has no joinBrowser()");
+      return driver.joinBrowser();
+    case "fetch_page":
+      if (driver.fetchPage === undefined) throw new Error("the driver has no fetchPage()");
+      return driver.fetchPage(step.url);
+    case "handoff_then_cancel":
+      if (driver.handoffThenCancel === undefined)
+        throw new Error("the driver has no handoffThenCancel()");
+      return driver.handoffThenCancel(step.text);
+    case "read_skill":
+      if (driver.readSkill === undefined) throw new Error("the driver has no readSkill()");
+      return driver.readSkill(step.name);
   }
 }
 

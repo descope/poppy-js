@@ -8,6 +8,7 @@ import {
   SUPPORTED_PROTOCOL_VERSIONS,
   supportedScopes,
 } from "../src/index.ts";
+import { decodeJwt } from "../src/jose.ts";
 import { checkSignInUrl } from "../src/oauth.ts";
 import { extensionsHeader, throwable } from "../src/session.ts";
 import {
@@ -36,6 +37,12 @@ async function setup(options: MockOptions = {}, store = new MemoryStore()) {
   const company = await agent.discover("example.com");
   const user = await agent.user(company, "alice");
   return { mock, agent, company, user, session: user.session() };
+}
+
+/** Signs a User in through Direct Sign-In, as the Company's own authorization endpoint would. */
+async function signInFor(mock: MockCompany, user: Awaited<ReturnType<typeof setup>>["user"]) {
+  const { url } = await user.startDirectSignIn({ scope: "orders:read" });
+  await user.completeDirectSignIn(await mock.approve(url));
 }
 
 describe("choosing a protocol version (spec 3.4)", () => {
@@ -807,5 +814,56 @@ describe("a Session forgets what the last one was told (spec 5.2, 9)", () => {
     expect(session.protocolVersion).toBe("0.3");
     // 0.3 names its own feedback endpoint in poppy.json; the 0.4 answer is not carried over.
     expect((await session.taskCoverage()).feedbackEndpoint).toBe(FEEDBACK);
+  });
+});
+
+describe("website pages fetched without a browser (spec 5.2, 5.6)", () => {
+  const PAGE = `https://${"example.com"}/help/returns`;
+
+  it("carries the Session header and never a token, on 0.4", async () => {
+    const { user, mock } = await setup({ version: "0.4" });
+    await signInFor(mock, user);
+    const session = user.session();
+    await (await session.fetchPage(PAGE)).body?.cancel();
+    const page = mock.requests.find((r) => r.url === PAGE);
+    expect(page?.headers.get("poppy-session")).not.toBeNull();
+    expect(page?.headers.get("poppy-version")).toBe("0.4");
+    // Signed in or not, a page request is signed out, so the JWT has no ath.
+    expect(page?.headers.get("authorization")).toBeNull();
+    // Read the JWT the page actually got: a page isn't a resource, so the mock records no claims.
+    const { payload } = decodeJwt(page?.headers.get("poppy-session") ?? "");
+    expect(payload["ath"]).toBeUndefined();
+    expect(payload["sid"]).toBe(session.id);
+    expect(payload["htu"]).toBe(PAGE);
+  });
+
+  it("sends no header on 0.3, where pages carry none", async () => {
+    const { session, mock } = await setup({ version: "0.3" });
+    await (await session.fetchPage(PAGE)).body?.cancel();
+    expect(mock.requests.find((r) => r.url === PAGE)?.headers.get("poppy-session")).toBeNull();
+  });
+
+  it("drops the header on a hop that leaves the Company's domain", async () => {
+    const { session, mock } = await setup({ version: "0.4" });
+    await (await session.fetchPage(`https://example.com/offsite`)).body?.cancel();
+    const away = mock.requests.find((r) => r.url.startsWith("https://elsewhere.test"));
+    expect(away).toBeDefined();
+    expect(away?.headers.get("poppy-session")).toBeNull();
+  });
+
+  it("asks again without the header when the page refuses it", async () => {
+    const { session, mock } = await setup({ version: "0.4", pageRejectsSession: true });
+    const response = await session.fetchPage(PAGE);
+    await response.body?.cancel();
+    expect(response.status).toBe(200);
+    const tries = mock.requests.filter((r) => r.url === PAGE);
+    expect(tries).toHaveLength(2);
+    expect(tries[0]?.headers.get("poppy-session")).not.toBeNull();
+    expect(tries[1]?.headers.get("poppy-session")).toBeNull();
+  });
+
+  it("refuses a page that isn't an HTTPS URL on a public host", async () => {
+    const { session } = await setup({ version: "0.4" });
+    await expect(session.fetchPage("http://example.com/x")).rejects.toThrow(PoppyProtocolError);
   });
 });

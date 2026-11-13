@@ -1,4 +1,4 @@
-import { API, type ConformanceCompany, MCP, type Scenario } from "./company.ts";
+import { API, type ConformanceCompany, MCP, PAGE, type Scenario } from "./company.ts";
 
 /**
  * One thing the agent under test does. Agents in any language carry out steps in order, and keep going
@@ -29,7 +29,15 @@ export type Step =
    */
   | { action: "task_coverage" }
   /** Report a task the User couldn't do, to the feedback endpoint the Company names (spec 9.3). */
-  | { action: "report_task"; task: string; description: string };
+  | { action: "report_task"; task: string; description: string }
+  /** Join the agent's own browser to the Session (spec section 6). Never the User's own browser. */
+  | { action: "join_browser" }
+  /** Fetch a page of the Company's website with the agent's own HTTP client, not a browser (5.2). */
+  | { action: "fetch_page"; url: string }
+  /** Ask for a person at the Company, then withdraw the request (spec 8.9). */
+  | { action: "handoff_then_cancel"; text: string }
+  /** Fetch one of the Company's skills and check it against its digest (spec 9.4). */
+  | { action: "read_skill"; name: string };
 
 /** Which parts of the protocol a scenario exercises. */
 export type Suite = "core" | "oauth" | "interactions" | "versions";
@@ -303,6 +311,68 @@ export const SCENARIOS: readonly ScenarioDefinition[] = [
     company: { version: "0.4", linkedVersionMismatch: true },
     steps: [discover, orders],
     evaluate: (c) => c.checkVersionSelection(),
+  },
+  {
+    name: "v04-conversation-state",
+    description: "0.4: the Company Agent keeps working, and a handoff is asked for then withdrawn.",
+    suite: "interactions",
+    company: { version: "0.4", slowAgent: true },
+    steps: [discover, { action: "handoff_then_cancel", text: "I need a person." }],
+  },
+  {
+    name: "v04-version-mismatch",
+    description: "0.4: the conversation started in versions the Company no longer continues.",
+    suite: "versions",
+    company: { version: "0.4", versionMismatch: true },
+    steps: [discover, { action: "converse", text: "Still there?" }],
+    evaluate: (c) => c.checkVersionMismatch(),
+  },
+  {
+    name: "v04-browser-join",
+    description: "0.4: a signed-in browser join, which needs poppy:browser-sign-in.",
+    suite: "interactions",
+    company: { version: "0.4" },
+    steps: [discover, { action: "sign_in", scopes: ["orders:read"] }, { action: "join_browser" }],
+  },
+  {
+    name: "v04-website-pages",
+    description: "0.4: a website page fetched with the agent's own HTTP client, signed in.",
+    suite: "interactions",
+    company: { version: "0.4" },
+    steps: [
+      discover,
+      { action: "sign_in", scopes: ["orders:read"] },
+      { action: "fetch_page", url: PAGE },
+    ],
+  },
+  {
+    name: "v04-page-refuses-session",
+    description: "0.4: a website page refuses the Session header once.",
+    suite: "interactions",
+    company: { version: "0.4", pageRejectsSession: true },
+    steps: [discover, { action: "fetch_page", url: PAGE }],
+  },
+  {
+    name: "skills-and-feedback",
+    description: "A skill fetched and checked against its digest, and a feedback report.",
+    suite: "interactions",
+    company: {},
+    steps: [
+      discover,
+      { action: "read_skill", name: "returns" },
+      {
+        action: "report_task",
+        task: "Pay with a gift card",
+        description: "No API or conversation offered a way to use a gift card.",
+      },
+    ],
+  },
+  {
+    name: "browser-join-0.3",
+    description: "0.3: a browser join, which needs no scope of its own.",
+    suite: "interactions",
+    company: {},
+    steps: [discover, { action: "join_browser" }],
   },
   {
     name: "v04-version-unsupported",

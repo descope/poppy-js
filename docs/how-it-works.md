@@ -258,6 +258,12 @@ sequenceDiagram
 
 `session.joinBrowser()` runs these steps with a `BrowserJoiner` you implement for your browser, such as Playwright. Join only your agent's own browser, never the User's. Join again after signing in or out, so the website matches.
 
+### Website pages without a browser
+
+From 0.4 an agent may read a page of the Company's website with its own HTTP client rather than a browser — a help article, say — and `session.fetchPage(url)` does it (spec 5.2). The request carries the Session header so the Company can tell which agent and Session it is from, and **never** an access token, so it is signed out even when a browser joined to the same Session is signed in. The header goes only to HTTPS URLs whose host is exactly `organization.domain`; a redirect that leaves that host is followed without it. If a page answers `invalid_session`, the page is fetched once more without the header, which is the only case where leaving it out is allowed (spec 5.6).
+
+On 0.3 no header is sent at all, since that version has website pages carry none. A headless browser is a browser, so it joins through `session.joinBrowser()` instead.
+
 ## Conversations
 
 `session.conversations()` talks with the Company Agent (spec 8). A conversation is a list of events: messages from both sides, state changes, and requests from the Company.

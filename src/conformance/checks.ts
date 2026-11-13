@@ -254,6 +254,44 @@ export const CHECKS: readonly Check[] = [
     title: "Gets tasks.endpoint with a GET and the Session header, and sends no access token (0.4)",
   },
 
+  // Browser join (section 6)
+  {
+    id: "browser.join",
+    section: "6",
+    level: "MUST",
+    title:
+      "Joins its own browser by loading browser_session_endpoint, authorizing the code it returned, and submitting the form",
+  },
+  {
+    id: "browser.code-source",
+    section: "6",
+    level: "MUST",
+    title:
+      "Authorizes only a code from the page its own browser loaded, never one from anywhere else",
+  },
+  {
+    id: "browser.sign-in-scope",
+    section: "6",
+    level: "MUST",
+    title:
+      "Signs a browser in only with poppy:browser-sign-in, and joins signed out or asks for the scope when it is refused (0.4)",
+  },
+
+  // Website pages fetched without a browser (0.4)
+  {
+    id: "web.page-session",
+    section: "5.2",
+    level: "SHOULD",
+    title: "Sends the Session header on website pages it fetches with its own HTTP client (0.4)",
+  },
+  {
+    id: "web.page-signed-out",
+    section: "5.2",
+    level: "MUST",
+    title:
+      "Never sends an access token with a website page request, so the page is signed out (0.4)",
+  },
+
   // Conversations
   {
     id: "conversation.messages",
@@ -267,6 +305,41 @@ export const CHECKS: readonly Check[] = [
     level: "MUST",
     title:
       "Every conversation POST carries a unique top-level request id, and its message carries none of its own (0.4)",
+  },
+
+  {
+    id: "conversation.working",
+    section: "8.7",
+    level: "MUST",
+    title:
+      "Reads a conversation until working is false before treating the Company as finished (0.4)",
+  },
+  {
+    id: "conversation.handoff-cancel",
+    section: "8.9",
+    level: "MUST",
+    title: "Withdraws a handoff at {endpoint}/{id}/handoff/cancel with its own request id (0.4)",
+  },
+  {
+    id: "conversation.version-mismatch",
+    section: "8.13",
+    level: "MUST",
+    title: "Stops sending on a conversation the Company refuses with version_mismatch (0.4)",
+  },
+
+  // Task coverage
+  {
+    id: "tasks.feedback",
+    section: "9.3",
+    level: "MUST",
+    title:
+      "Reports feedback to the endpoint the Company named, with the Session header and no token",
+  },
+  {
+    id: "tasks.skill-digest",
+    section: "9.4",
+    level: "MUST",
+    title: "Checks a skill artifact against its digest, and carries no credential when fetching it",
   },
 
   // Extensions

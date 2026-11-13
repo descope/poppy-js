@@ -14,7 +14,7 @@ import { isLoopbackRedirect } from "./metadata.ts";
 import { requireOAuth } from "./oauth.ts";
 import type { OperatorSignatureOptions } from "./operator.ts";
 import { ResourceResolver } from "./resources.ts";
-import { Session } from "./session.ts";
+import { type Rediscovered, Session } from "./session.ts";
 import { DelegatedKeys } from "./session-jwt.ts";
 import { MemoryStore, type Store } from "./store.ts";
 
@@ -34,8 +34,12 @@ export interface PoppyAgentOptions {
   /** The default `redirect_uri` for Direct Sign-In, one of your `redirect_uris` (spec 4.2). */
   redirectUri?: string;
   /**
-   * Extensions you list in your client metadata (spec 3.3), such as `{ operations: { version: "2" } }`.
-   * Keep it the same as the document, so the Company and this client agree on what you support.
+   * The extensions you support, by name, such as `{ operations: { version: "2" } }` (spec 3.3).
+   *
+   * On 0.3 you also list them in your client metadata document, so keep the two the same. From 0.4 the
+   * client metadata has no `extensions`: each request declares the ones you use with that Company in
+   * `Poppy-Extensions`, and this SDK declares those a Company also lists, the same throughout a Session
+   * (spec 3.4).
    */
   extensions?: Readonly<Record<string, { version: string }>>;
   /** Seconds each delegation lasts, at most 24 hours (spec 5.2). Defaults to one hour. */
@@ -356,6 +360,33 @@ export class PoppyAgent {
     return run;
   }
 
+  /** Resolvers are shared per Company, and per version: each version lists its own endpoints. */
+  #resolverKey(company: Company): string {
+    return `${company.identifier} ${company.domain} ${company.protocolVersion}`;
+  }
+
+  /**
+   * Discovers a Company again, without a cached copy, and chooses a version again (spec 3.4).
+   *
+   * The resolver is always built from the document this call just read, and is NOT written to the
+   * shared cache. A cached one wraps the Company an earlier discovery found, and this is the one
+   * path whose purpose is to go past what was cached: reusing it would let `isDestination` accept an
+   * endpoint the Company's current document has dropped, and attach credentials to it (spec 5.2).
+   * Writing it back would be the same mistake pointing the other way — a rediscovery that keeps its
+   * version hands nothing to the Session, so a `PoppyUser` still holding the Company from before
+   * would be paired with a resolver built from a document it never saw, and its own listed APIs
+   * would stop resolving. Only the Session that adopts the new Company takes this resolver.
+   */
+  #rediscover(company: Company): Promise<Rediscovered> {
+    return discover(company.domain, {
+      fetch: this.#fetch,
+      allowPrivateAddresses: this.#allowPrivate,
+    }).then((found) => ({
+      company: found,
+      resolver: new ResourceResolver(found, this.#fetch, this.#allowPrivate),
+    }));
+  }
+
   /** @internal */
   sessionInit(
     company: Company,
@@ -367,6 +398,8 @@ export class PoppyAgent {
     fetch: Fetch;
     operator: OperatorSignatureOptions | undefined;
     allowPrivateAddresses: boolean;
+    extensions: Readonly<Record<string, { version: string }>>;
+    rediscover: () => Promise<Rediscovered>;
   } {
     // One set of delegated keys per User ID, so no key signs for two (spec 5.2). An anonymous User's
     // keys live only as long as its PoppyUser, so they're discarded with it (spec 5.1).
@@ -376,7 +409,7 @@ export class PoppyAgent {
       keys = new DelegatedKeys(this.clientId, this.#signer, this.#delegationLifetime);
       if (!anonymous) this.#keys.set(keysKey, keys);
     }
-    const resolverKey = `${company.identifier} ${company.domain}`;
+    const resolverKey = this.#resolverKey(company);
     let resolver = this.#resolvers.get(resolverKey);
     if (resolver === undefined) {
       resolver = new ResourceResolver(company, this.#fetch, this.#allowPrivate);
@@ -388,6 +421,8 @@ export class PoppyAgent {
       fetch: this.#fetch,
       operator: this.#operator,
       allowPrivateAddresses: this.#allowPrivate,
+      extensions: this.extensions,
+      rediscover: () => this.#rediscover(company),
     };
   }
 
@@ -445,14 +480,46 @@ export class PoppyUser {
   /**
    * Starts a new Session with a fresh random `sid` (spec 5.2). Run several for tasks in parallel. Sessions
    * share this account's sign-in.
+   *
+   * Pass `id` to continue a Session this same User started, with the `sid` you saved from
+   * {@link Session.id}, and `protocolVersion` with the {@link Session.protocolVersion} you saved
+   * beside it. A Session lasts until the agent stops using its `sid` (spec 5.5), so an agent that
+   * doesn't stay running keeps one Session rather than opening a new one for every command, and the
+   * Company sees the User's activity as the one Session it is.
+   *
+   * What a resumed `sid` needs:
+   *
+   * - The same User. Every Session JWT of a Session carries the same `sub` and Agent ID, and a
+   *   Company rejects one that doesn't (spec 5.2, 5.3). The `sub` is the pairwise User ID this agent
+   *   stores, so a process that starts with the default {@link MemoryStore} mints a new one and the
+   *   Company answers `invalid_session`: give {@link PoppyAgentOptions.store} a persistent store, and
+   *   the same `localUserId`. An anonymous User can't be resumed at all, and this throws if you try.
+   * - The same protocol version. A Session uses one version throughout (spec 3.4). Pass the version
+   *   you saved: if the Company now serves another one, a new Session starts instead of sending the
+   *   old `sid` under a version it never used. Compare {@link Session.id} with what you passed to
+   *   see which happened.
+   * - A Session that hasn't ended. Once the Company ends one, or you call {@link Session.end}, stop
+   *   using that `sid` (spec 5.5). If the Company has ended it, the next request gets `session_ended`
+   *   and this SDK starts a new Session with a new `sid` on its own.
    */
-  session(): Session {
+  session(options: { id?: string; protocolVersion?: string } = {}): Session {
+    if (options.id !== undefined && this.anonymous)
+      throw new PoppyProtocolError(
+        "an anonymous User gets a new User ID each time, so its Session can't be resumed (spec 5.1)",
+      );
+    // A Session keeps one protocol version throughout (spec 3.4). When the Company now serves
+    // another one, the saved `sid` belongs to a Session that can't continue here, so a new one
+    // starts instead of sending that `sid` under a version it never used.
+    const resumable =
+      options.protocolVersion === undefined ||
+      options.protocolVersion === this.company.protocolVersion;
     return new Session({
       company: this.company,
       clientId: this.#agent.clientId,
       userId: this.userId,
       agentId: this.agentId,
       account: this.#init.account,
+      ...(options.id === undefined || !resumable ? {} : { sid: options.id }),
       ...this.#sessionInit(),
     });
   }

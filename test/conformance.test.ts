@@ -1,11 +1,13 @@
 import { describe, expect, it } from "vitest";
 import { type AgentFactory, formatReport, runConformance } from "../src/conformance/index.ts";
+import { BROWSER_SESSION } from "../src/conformance/company.ts";
 import {
   approvalFor,
   clientMetadata,
   jwks,
   operationFromResponse,
   PoppyAgent,
+  PoppyError,
   type PoppyUser,
   type Session,
 } from "../src/index.ts";
@@ -75,6 +77,48 @@ function sdkFactory(privateKey: CryptoKey): AgentFactory {
         await conversation.send({ text: "Thanks" });
         await conversation.readAll();
       },
+      async taskCoverage() {
+        await ready().session.taskCoverage();
+      },
+      async reportTask(report) {
+        await ready().session.sendFeedback(report);
+      },
+      async joinBrowser() {
+        const { session: s } = ready();
+        // A fake browser: the conformance Company serves the page with the form, and this reads the
+        // code from it exactly as a real browser's DOM would be read (section 6).
+        const page = await (await fetch(BROWSER_SESSION)).text();
+        const code = /name="code" value="([^"]+)"/.exec(page)?.[1] ?? "";
+        try {
+          await s.authorizeBrowserCode(code);
+        } catch (error) {
+          // From 0.4 a signed-in join needs poppy:browser-sign-in. Without it, this agent takes the
+          // other answer the spec allows and joins signed out rather than asking for the scope.
+          if (!(error instanceof PoppyError) || error.error !== "insufficient_scope") throw error;
+          await s.authorizeBrowserCode(code, { signedOut: true });
+        }
+        await fetch(`${BROWSER_SESSION}/submit`, {
+          method: "POST",
+          headers: { "content-type": "application/x-www-form-urlencoded" },
+          body: new URLSearchParams({ code }).toString(),
+        });
+      },
+      async fetchPage(url) {
+        const response = await ready().session.fetchPage(url);
+        await response.body?.cancel();
+      },
+      async handoffThenCancel(text) {
+        const { session: s } = ready();
+        const { conversation } = await s.conversations().start({ text });
+        // Read until the Company has no work in progress before deciding anything (8.7).
+        let update = await conversation.readAll({ wait: 1 });
+        while (update.working) update = await conversation.readAll({ wait: 1 });
+        await conversation.handoff();
+        await conversation.cancelHandoff();
+      },
+      async readSkill(name) {
+        await ready().session.fetchSkill(name);
+      },
       async requestWithApproval(url, init) {
         const { session: s } = ready();
         const refused = await s.fetch(url, init);
@@ -127,7 +171,7 @@ describe("conformance suite", () => {
       "conversation.messages": "skip",
     });
     expect(formatReport(report)).toMatch(
-      /^Personal Agent Protocol 0\.3 conformance: \d+ passed, \d+ failed, \d+ skipped/,
+      /^Personal Agent Protocol 0\.4 and 0\.3 conformance: \d+ passed, \d+ failed, \d+ skipped/,
     );
   });
 });

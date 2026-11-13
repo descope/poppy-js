@@ -1,6 +1,14 @@
 import type { Api, Company } from "./discovery.ts";
 import { PoppyProtocolError } from "./errors.ts";
-import { type Fetch, getJson, getText, isObject, originOf, resourceMetadataUrl } from "./http.ts";
+import {
+  type Fetch,
+  getJson,
+  getText,
+  isObject,
+  originOf,
+  resourceMetadataUrl,
+  withoutTrailingSlashes,
+} from "./http.ts";
 
 /** Which access token a request uses (spec 4.5). */
 export interface ResourceChoice {
@@ -77,6 +85,7 @@ export class ResourceResolver {
     const company = this.#company;
     const exact = [
       company.feedbackEndpoint,
+      company.tasksEndpoint,
       company.browserSessionEndpoint === undefined
         ? undefined
         : `${company.browserSessionEndpoint.replace(/\/$/, "")}/authorize`,
@@ -85,8 +94,10 @@ export class ResourceResolver {
     const prefixes: Service[] = [
       ...company.apis.filter((api) => api.type === "mcp").map((api) => api.url),
       ...company.conversationProtocols.map((p) => p.endpoint),
-      ...Object.values(company.extensions).flatMap((entry) =>
-        typeof entry["endpoint"] === "string" ? [entry["endpoint"]] : [],
+      ...Object.values(company.extensions).flatMap((entries) =>
+        entries.flatMap((entry) =>
+          typeof entry["endpoint"] === "string" ? [entry["endpoint"]] : [],
+        ),
       ),
       ...this.#extensionEndpoints,
     ].map((prefix) => ({ url: prefix, mcp: false }));
@@ -157,6 +168,12 @@ export class ResourceResolver {
     const resource = body["resource"];
     if (service.mcp && resource !== service.url)
       throw new PoppyProtocolError(`MCP server metadata resource must equal ${service.url}`);
+    // From 0.4, metadata whose resource isn't the URL its URL was derived from is treated as absent, as
+    // RFC 9728 section 3.3 requires (spec 4.5), so the default token is used instead.
+    const sameResource = (a: string, b: string) =>
+      withoutTrailingSlashes(a) === withoutTrailingSlashes(b);
+    if (this.#company.protocolVersion !== "0.3" && !sameResource(resource, service.url))
+      return { ...DEFAULT, service: service.url };
     // The domain's own resource means the default token works here (spec 4.5).
     if (!service.mcp && resource === originOf(this.#company.domain))
       return { ...DEFAULT, service: service.url };

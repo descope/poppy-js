@@ -2,13 +2,13 @@
 
 <!-- prettier-ignore -->
 > [!IMPORTANT]
-> **This SDK implements [draft 0.3](https://personalagentprotocol.org/docs/spec.md) of the Personal Agent Protocol.** It follows the draft as of spec commit [`7205250`](https://github.com/personal-agent-protocol/personal-agent-protocol/commit/7205250) (2026-11-02). The spec can still change in ways that aren't backward compatible before 1.0, and so can this SDK. Each release names the draft it follows.
+> **This SDK implements [0.4](https://personalagentprotocol.org/docs/0.4/spec) and [0.3](https://personalagentprotocol.org/docs/0.3/spec) of the Personal Agent Protocol.** Both are published and frozen, and a Company serves one of them while an agent meets many: `discover()` picks the newest version a Company serves that this SDK implements, and everything after that follows it. 0.4 is the 1.0 release candidate; draft 1.0 is still in progress, and can change in ways that aren't backward compatible, so each release names the versions it follows.
 
 <!-- prettier-ignore -->
 > [!NOTE]
 > **This is a community SDK, not owned by any vendor.** It works with any Company and any authorization server that follows the spec. For a feature or a larger change, please [open an issue](https://github.com/descope/poppy-js/issues/new) first; see [CONTRIBUTING.md](CONTRIBUTING.md).
 
-![Apache-2.0 licensed](https://img.shields.io/badge/license-Apache--2.0-blue) ![Spec draft 0.3](https://img.shields.io/badge/spec-draft%200.3-purple) ![Node.js 22+](https://img.shields.io/badge/node-%E2%89%A522-green)
+![Apache-2.0 licensed](https://img.shields.io/badge/license-Apache--2.0-blue) ![Spec 0.4 and 0.3](https://img.shields.io/badge/spec-0.4%20%7C%200.3-purple) ![Node.js 22+](https://img.shields.io/badge/node-%E2%89%A522-green)
 
 <details>
 <summary>Table of Contents</summary>
@@ -30,11 +30,12 @@ The Personal Agent Protocol (Poppy for short) lets a Personal Agent, acting for 
 
 This repository contains the TypeScript SDK for the **Personal Agent** side of the protocol. It handles the protocol for you, so your agent can focus on the User's task:
 
-- **Discovery** of a Company, with every check the spec requires before anything is sent to it
+- **Discovery** of a Company, with every check the spec requires before anything is sent to it, including picking the newest protocol version it serves that this SDK implements
 - **Sessions**: a pairwise User ID per Company, and a fresh, signed Session JWT on every request
 - **Sign-in** with Direct, Device or Mediated Sign-In, and automatic token refresh, rotation and DPoP
 - **Interactions**: APIs and MCP servers, the Company's website through browser join, and conversations with the Company Agent
-- **Task coverage**, including the Company's skills, and the **Operations**, **Links** and **Disclosures** extensions
+- **Task coverage**: a Company's excluded tasks, skills and feedback endpoint, from `poppy.json` on 0.3 or per Session on 0.4, behind one API
+- The **Operations**, **Links** and **Disclosures** extensions
 - **UCP**: through Poppy's UCP extension, discover a Company's Universal Commerce Protocol profile, negotiate, and check out with signed requests in the User's Poppy Session
 - **A conformance suite** that checks a Personal Agent in any language against the spec, which this SDK passes in full
 - **Tools for models**: hand a Company to the Vercel AI SDK, Anthropic, OpenAI or any MCP client as tools, with secrets kept out of the model

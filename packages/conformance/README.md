@@ -39,7 +39,7 @@ For each scenario, the harness:
 
 1. Sets up a test Company that behaves as the scenario says, such as one whose `poppy.json` names another domain, or whose issuer rotates refresh tokens.
 2. Runs your agent once, with the scenario in its environment.
-3. Records every request your agent sends, and checks it against the rules spec draft 0.3 sets for Personal Agents.
+3. Records every request your agent sends, and checks it against the rules spec 0.4 and 0.3 set for Personal Agents.
 4. Writes the results, and reports each check as passed, failed or skipped.
 
 The protocol requires HTTPS and real hostnames, so the harness is an HTTPS proxy rather than a local server. Your agent reaches the test Company's hosts (`shop.test`, `www.shop.test`, `mcp.shop.test`) through `HTTPS_PROXY`, and trusts a certificate authority made for the run. Most HTTP clients honor both through standard environment variables, so your agent needs no test-only code paths.
@@ -115,7 +115,7 @@ Each scenario writes `results/<scenario>-<timestamp>/`:
 The CLI then prints a line per check, across every scenario:
 
 ```text
-Personal Agent Protocol 0.3 conformance: 30 passed, 0 failed, 2 skipped
+Personal Agent Protocol 0.4 and 0.3 conformance: 48 passed, 0 failed, 2 skipped
 SKIP  MUST   4.1           identity.metadata
 PASS  MUST   3             discovery.well-known-path
 ...

@@ -10,10 +10,35 @@ const ID = /^[A-Za-z0-9_-]{1,256}$/;
 const POLL_WAIT = 30;
 const RECONNECT_DELAY = 1000;
 
-/** `idle`, `queued` and `closed`, or `working`, which unknown values also read as (spec 8.7). */
+/**
+ * The 0.3 `status`: `idle`, `queued` and `closed`, or `working`, which unknown values also read as
+ * (0.3 spec 8.7).
+ *
+ * 0.4 replaced it with {@link ConversationState}'s four independent fields, because a conversation can be
+ * in several of these at once. {@link Conversation.status} still reports one of these values on both
+ * versions, derived from the state, so code written for 0.3 keeps working.
+ */
 export type ConversationStatus = "working" | "idle" | "queued" | "closed";
+/** `none`, or `pending` while the Company looks for a person (spec 8.7, 8.9). */
+export type Handoff = "none" | "pending";
 /** `agent`, or `human`, which unknown values also read as (spec 8.7). */
 export type Responder = "agent" | "human";
+
+/**
+ * A conversation's state (spec 8.7). From 0.4 the Company reports these four independent fields, so the
+ * Company Agent can keep answering while the Company looks for a person. On 0.3 they are derived from
+ * `status`, which carries one value at a time.
+ */
+export interface ConversationState {
+  /** The Company has work in progress, including a request it accepted but hasn't acted on. */
+  working: boolean;
+  /** `pending` while the Company is looking for a person to join. */
+  handoff: Handoff;
+  /** Who is handling the Company side. */
+  responder: Responder;
+  /** The conversation takes no more messages, handoff requests or handoff cancels. */
+  closed: boolean;
+}
 
 /** Who wrote a message (spec 8.4, 8.8). */
 export interface Author {
@@ -50,13 +75,22 @@ export interface Disclosure {
 
 /** A message the agent sends. Needs at least one of `text`, `data`, `context` or `approval`. */
 export interface OutgoingMessage {
-  /** Unique for the User; reuse it to retry the same message (spec 8.3). Generated when left out. */
+  /**
+   * Unique for the User; reuse it to retry the same request (spec 8.3). Generated when left out. On 0.3
+   * it is the message's ID; from 0.4 it is the request's ID, which the message takes as its own.
+   */
   id?: string;
   /** Defaults to `{ type: "agent" }`. */
   author?: { type: "agent" | "human" };
   text?: string;
   data?: Record<string, unknown>;
   context?: MessageContext;
+  /**
+   * The last cursor the agent had read when it wrote this message (spec 8.4), from 0.4, so the Company
+   * can tell which of its messages the agent had seen. A hint only, and only on a message the agent
+   * wrote: a message with `author.type` `human` must not carry it. Ignored on 0.3.
+   */
+  asOfCursor?: string;
   /**
    * The User's approval of an operation, sent in `extensions.operations` (Operations extension section 6).
    * Only to a Company that lists the Operations extension, version 2.
@@ -66,6 +100,7 @@ export interface OutgoingMessage {
 
 /** A message from either side, as the Company recorded it (spec 8.4). */
 export interface ConversationMessage {
+  /** The Company sets it when it records the message: the request's ID for the agent's own messages. */
   id: string;
   /** `user` or `company`, the side it came from. */
   role: string;
@@ -73,6 +108,13 @@ export interface ConversationMessage {
   text: string | undefined;
   data: Readonly<Record<string, unknown>> | undefined;
   context: Readonly<Record<string, unknown>> | undefined;
+  /**
+   * On a message from the Company Agent, the ID of the latest request it took into account (spec 8.4),
+   * from 0.4. A hint for matching a short reply to what it answers, never something to depend on.
+   */
+  asOfRequest: string | undefined;
+  /** On a message the agent wrote, the last cursor it had read when it wrote it (spec 8.4), from 0.4. */
+  asOfCursor: string | undefined;
   /** Content defined by extensions, keyed by extension name, as sent (spec 8.4). */
   extensions: Readonly<Record<string, unknown>> | undefined;
   /** An operation awaiting the User's approval, from `extensions.operations` (Operations section 4). */
@@ -89,19 +131,33 @@ interface EventBase {
   createdAt: string;
 }
 
-/** An event in a conversation (spec 8.5). Events of unknown types are skipped. */
+/**
+ * An event in a conversation (spec 8.5). Events of unknown types are skipped.
+ *
+ * A `state` event carries `handoff`, `responder` and `closed` from 0.4, and `status` and `responder` on
+ * 0.3; both are read into the same fields, with the ones the version doesn't send derived from the ones
+ * it does. `working` is not an event on either version (spec 8.7).
+ */
 export type ConversationEvent =
   | (EventBase & { type: "message"; message: ConversationMessage })
-  | (EventBase & { type: "state"; status: ConversationStatus; responder: Responder })
+  | (EventBase & {
+      type: "state";
+      status: ConversationStatus;
+      handoff: Handoff;
+      responder: Responder;
+      closed: boolean;
+      /** Undefined on 0.4, where a state event says nothing about `working` (spec 8.7). */
+      working: boolean | undefined;
+    })
   | (EventBase & { type: "authorization"; error: string; scope: string })
   | (EventBase & { type: "user_requested"; reason: string })
   | (EventBase & { type: "direct_opened" | "direct_closed"; conversationId: string });
 
 /** What a request returned: new events, deduplicated, and the conversation's state after them. */
-export interface ConversationUpdate {
+export interface ConversationUpdate extends ConversationState {
   events: ConversationEvent[];
+  /** The 0.3 `status`, derived from the state on 0.4 (spec 8.7). */
   status: ConversationStatus;
-  responder: Responder;
   /** When true, read again right away (spec 8.5). */
   hasMore: boolean;
 }
@@ -111,6 +167,8 @@ export type StreamItem =
   | { type: "event"; event: ConversationEvent }
   /** A piece of a message the Company Agent is still writing (spec 8.6). Replace with the `message` event. */
   | { type: "text-delta"; messageId: string; text: string }
+  /** `working` changed (spec 8.6, 8.7), which is state rather than an event, so it has no cursor. */
+  | { type: "working"; working: boolean }
   /** The stream reconnected: drop pieces of messages not yet received in full (spec 8.6). */
   | { type: "reconnected" };
 
@@ -118,8 +176,30 @@ function normalizeStatus(value: unknown): ConversationStatus {
   return value === "idle" || value === "queued" || value === "closed" ? value : "working";
 }
 
+function normalizeHandoff(value: unknown): Handoff {
+  // An unrecognized value reads as pending, the more cautious answer (spec 8.7).
+  return value === "none" ? "none" : "pending";
+}
+
 function normalizeResponder(value: unknown): Responder {
   return value === "agent" ? "agent" : "human";
+}
+
+/** The 0.3 `status` a 0.4 state corresponds to, so one API reports both versions (spec 8.7). */
+function statusFor(state: ConversationState): ConversationStatus {
+  if (state.closed) return "closed";
+  if (state.handoff === "pending") return "queued";
+  return state.working ? "working" : "idle";
+}
+
+/** The 0.4 state a 0.3 `status` corresponds to. `queued` meant waiting for a person, with no work shown. */
+function stateFor(status: ConversationStatus, responder: Responder): ConversationState {
+  return {
+    working: status === "working",
+    handoff: status === "queued" ? "pending" : "none",
+    responder,
+    closed: status === "closed",
+  };
 }
 
 function parseAuthor(value: unknown): Author {
@@ -151,8 +231,10 @@ function parseDisclosures(content: unknown): Disclosure[] {
   );
 }
 
-function parseMessage(value: unknown): ConversationMessage | undefined {
-  if (!isObject(value) || typeof value["id"] !== "string") return undefined;
+function parseMessage(value: unknown, eventId: string): ConversationMessage | undefined {
+  if (!isObject(value)) return undefined;
+  // The Company sets the message's id when it records it (spec 8.4); fall back to the event's own.
+  const id = typeof value["id"] === "string" ? value["id"] : eventId;
   const extensions = isObject(value["extensions"]) ? value["extensions"] : undefined;
   const operations = extensions?.["operations"];
   let operation: Operation | undefined;
@@ -164,12 +246,14 @@ function parseMessage(value: unknown): ConversationMessage | undefined {
     }
   }
   return {
-    id: value["id"],
+    id,
     role: typeof value["role"] === "string" ? value["role"] : "company",
     author: parseAuthor(value["author"]),
     text: typeof value["text"] === "string" ? value["text"] : undefined,
     data: isObject(value["data"]) ? value["data"] : undefined,
     context: isObject(value["context"]) ? value["context"] : undefined,
+    asOfRequest: typeof value["as_of_request"] === "string" ? value["as_of_request"] : undefined,
+    asOfCursor: typeof value["as_of_cursor"] === "string" ? value["as_of_cursor"] : undefined,
     extensions,
     operation,
     links: parseLinks(extensions?.["links"]),
@@ -186,16 +270,29 @@ export function parseEvent(value: unknown): ConversationEvent | undefined {
   };
   switch (value["type"]) {
     case "message": {
-      const message = parseMessage(value["message"]);
+      const message = parseMessage(value["message"], base.id);
       return message === undefined ? undefined : { ...base, type: "message", message };
     }
-    case "state":
+    case "state": {
+      const responder = normalizeResponder(value["responder"]);
+      // 0.3 sends status, which carries all four; 0.4 sends handoff, responder and closed, and says
+      // nothing about working, which isn't recorded as an event (spec 8.7).
+      if (value["status"] !== undefined) {
+        const state = stateFor(normalizeStatus(value["status"]), responder);
+        return { ...base, type: "state", ...state, status: statusFor(state) };
+      }
+      const handoff = normalizeHandoff(value["handoff"]);
+      const closed = value["closed"] === true;
       return {
         ...base,
         type: "state",
-        status: normalizeStatus(value["status"]),
-        responder: normalizeResponder(value["responder"]),
+        working: undefined,
+        handoff,
+        responder,
+        closed,
+        status: statusFor({ working: false, handoff, responder, closed }),
       };
+    }
     case "authorization":
       return {
         ...base,
@@ -219,14 +316,25 @@ export function parseEvent(value: unknown): ConversationEvent | undefined {
   }
 }
 
+function requestId(id: string | undefined, prefix = "msg_"): string {
+  const value = id ?? randomId(prefix);
+  if (!ID.test(value))
+    throw new PoppyProtocolError("a request id must be 1 to 256 URL-safe base64 characters");
+  return value;
+}
+
+/**
+ * Builds a conversation POST body (spec 8.3). On 0.3 the message carries its own `id`; from 0.4 the
+ * request carries a top-level `id` and the message takes it as its own, so a retried request can't act
+ * twice whatever its path.
+ */
 function messageBody(
   message: OutgoingMessage,
   defaultAuthor: "agent" | "human",
   company: Company,
+  extra: Record<string, unknown> = {},
 ): Record<string, unknown> {
-  const id = message.id ?? randomId("msg_");
-  if (!ID.test(id))
-    throw new PoppyProtocolError("message id must be 1 to 256 URL-safe base64 characters");
+  const id = requestId(message.id);
   if (
     message.text === undefined &&
     message.data === undefined &&
@@ -234,21 +342,28 @@ function messageBody(
     message.approval === undefined
   )
     throw new PoppyProtocolError("a message needs text, data, context or an approval");
-  // A side sends an extension's content only to one that lists the same version (spec 8.4).
+  // A side sends an extension's content only to one that uses the same version (spec 8.4).
   if (message.approval !== undefined && !companySupports(company, "operations", "2"))
     throw new PoppyProtocolError(
       `${company.domain} doesn't list the Operations extension, version 2`,
     );
-  return {
-    id,
-    author: { type: message.author?.type ?? defaultAuthor },
+  const author = message.author?.type ?? defaultAuthor;
+  // Only a message an AI wrote says what it had read; a person's doesn't (spec 8.4).
+  const asOfCursor =
+    company.protocolVersion === "0.3" || author === "human" ? undefined : message.asOfCursor;
+  const body = {
+    author: { type: author },
     ...(message.text === undefined ? {} : { text: message.text }),
     ...(message.data === undefined ? {} : { data: message.data }),
     ...(message.context === undefined ? {} : { context: message.context }),
+    ...(asOfCursor === undefined ? {} : { as_of_cursor: asOfCursor }),
     ...(message.approval === undefined
       ? {}
       : { extensions: { operations: { approval: approvalField(message.approval) } } }),
   };
+  return company.protocolVersion === "0.3"
+    ? { ...extra, message: { id, ...body } }
+    : { id, ...extra, message: body };
 }
 
 function withQuery(url: string, query: Record<string, string | number | undefined>): string {
@@ -276,11 +391,7 @@ export class Conversations {
     message: OutgoingMessage,
     options: { wait?: number } = {},
   ): Promise<{ conversation: Conversation; update: ConversationUpdate }> {
-    return this.#create(
-      { message: messageBody(message, "agent", this.session.company) },
-      options.wait,
-      false,
-    );
+    return this.#create(messageBody(message, "agent", this.session.company), options.wait, false);
   }
 
   /**
@@ -293,26 +404,34 @@ export class Conversations {
   async openDirect(
     parentConversationId: string,
     message: OutgoingMessage | undefined,
-    options: { wait?: number; userRequestedEventId?: string } = {},
+    options: { wait?: number; userRequestedEventId?: string; id?: string } = {},
   ): Promise<{ conversation: Conversation; update: ConversationUpdate }> {
     const { userRequestedEventId } = options;
     if (message === undefined && userRequestedEventId === undefined)
       throw new PoppyProtocolError("a Direct Conversation starts with a message or an acceptance");
     if (userRequestedEventId !== undefined && !ID.test(userRequestedEventId))
       throw new PoppyProtocolError("malformed event ID");
-    return this.#create(
-      {
-        parent_conversation_id: parentConversationId,
-        ...(userRequestedEventId === undefined
-          ? {}
-          : { user_requested_event_id: userRequestedEventId }),
-        ...(message === undefined
-          ? {}
-          : { message: messageBody(message, "human", this.session.company) }),
-      },
-      options.wait,
-      true,
-    );
+    const company = this.session.company;
+    const links = {
+      parent_conversation_id: parentConversationId,
+      ...(userRequestedEventId === undefined
+        ? {}
+        : { user_requested_event_id: userRequestedEventId }),
+    };
+    // From 0.4 every POST carries a request id, including one that opens a Direct Conversation with no
+    // message of its own (spec 8.3, 8.10).
+    const body =
+      message === undefined
+        ? company.protocolVersion === "0.3"
+          ? links
+          : { id: requestId(options.id, "dir_"), ...links }
+        : messageBody(
+            { ...message, ...(options.id === undefined ? {} : { id: options.id }) },
+            "human",
+            company,
+            links,
+          );
+    return this.#create(body, options.wait, true);
   }
 
   /**
@@ -344,7 +463,7 @@ export class Conversations {
     if (typeof id !== "string" || !ID.test(id))
       throw new PoppyProtocolError("the Company returned no valid conversation_id");
     const conversation = new Conversation(this, id, undefined, direct);
-    return { conversation, update: conversation.apply(response) };
+    return { conversation, update: conversation.apply(response, true) };
   }
 
   /** Sends a JSON request and returns the JSON body, throwing {@link PoppyError} on an error status. */
@@ -380,8 +499,13 @@ export class Conversation {
   readonly direct: boolean;
   readonly #conversations: Conversations;
   #cursor: string | undefined;
-  #status: ConversationStatus = "working";
-  #responder: Responder = "agent";
+  // A new conversation starts working, with no handoff and no person (spec 8.7).
+  #state: ConversationState = {
+    working: true,
+    handoff: "none",
+    responder: "agent",
+    closed: false,
+  };
   readonly #seen = new Set<string>();
 
   constructor(
@@ -396,12 +520,31 @@ export class Conversation {
     this.direct = direct;
   }
 
+  /**
+   * The conversation's state after the last response (spec 8.7): `working`, `handoff`, `responder` and
+   * `closed`. On 0.3 these are derived from `status`.
+   */
+  get state(): ConversationState & { status: ConversationStatus } {
+    return { ...this.#state, status: statusFor(this.#state) };
+  }
+
+  /** The Company has work in progress. Read until it's false to get its whole reply (spec 8.7). */
+  get working(): boolean {
+    return this.#state.working;
+  }
+
+  /** The conversation takes no more messages (spec 8.12). */
+  get closed(): boolean {
+    return this.#state.closed;
+  }
+
+  /** The 0.3 `status` for the current state, derived from it on 0.4 (spec 8.7). */
   get status(): ConversationStatus {
-    return this.#status;
+    return statusFor(this.#state);
   }
 
   get responder(): Responder {
-    return this.#responder;
+    return this.#state.responder;
   }
 
   /** The cursor after the last event handled. Save it to resume later (spec 8.5). */
@@ -424,7 +567,7 @@ export class Conversation {
   }
 
   /** Applies a response: handles new events in order and saves the cursor after them (spec 8.5). */
-  apply(response: Record<string, unknown>): ConversationUpdate {
+  apply(response: Record<string, unknown>, accepted = false): ConversationUpdate {
     const events: ConversationEvent[] = [];
     if (Array.isArray(response["events"])) {
       for (const raw of response["events"]) {
@@ -436,20 +579,45 @@ export class Conversation {
         const event = parseEvent(raw);
         if (event === undefined) continue;
         if (event.type === "state") {
-          this.#status = event.status;
-          this.#responder = event.responder;
+          this.#state = {
+            // A 0.4 state event says nothing about working, so it keeps its value (spec 8.7).
+            working: event.working ?? this.#state.working,
+            handoff: event.handoff,
+            responder: event.responder,
+            closed: event.closed,
+          };
+          // `status` is only knowable once the event is merged with the `working` its version
+          // doesn't report, or a 0.4 event on a working conversation would read as `idle`.
+          events.push({ ...event, status: statusFor(this.#state) });
+          continue;
         }
         events.push(event);
       }
       if (typeof response["cursor"] === "string") this.#cursor = response["cursor"];
     }
-    if (response["status"] !== undefined) this.#status = normalizeStatus(response["status"]);
-    if (response["responder"] !== undefined)
-      this.#responder = normalizeResponder(response["responder"]);
+    // The state fields of a read are the state when the Company responded, so they can be newer than
+    // the events returned (spec 8.5). 0.3 reports status and responder; 0.4 reports all four.
+    if (response["status"] !== undefined) {
+      this.#state = stateFor(
+        normalizeStatus(response["status"]),
+        normalizeResponder(response["responder"] ?? this.#state.responder),
+      );
+    } else {
+      if (typeof response["working"] === "boolean") this.#state.working = response["working"];
+      if (response["handoff"] !== undefined)
+        this.#state.handoff = normalizeHandoff(response["handoff"]);
+      if (typeof response["closed"] === "boolean") this.#state.closed = response["closed"];
+      if (response["responder"] !== undefined)
+        this.#state.responder = normalizeResponder(response["responder"]);
+    }
+    // A POST the Company accepted but whose reply carries no state: it has work in progress from the
+    // moment it accepts a request, so a caller doesn't read `working: false` and close too early.
+    if (accepted && response["status"] === undefined && typeof response["working"] !== "boolean")
+      this.#state.working = true;
     return {
       events,
-      status: this.#status,
-      responder: this.#responder,
+      ...this.#state,
+      status: statusFor(this.#state),
       hasMore: response["has_more"] === true,
     };
   }
@@ -472,7 +640,7 @@ export class Conversation {
       wait: options.wait,
       cursor: options.wait === undefined ? undefined : this.#cursor,
     });
-    return this.apply(await this.#conversations.request("POST", url, { message: body }));
+    return this.apply(await this.#conversations.request("POST", url, body), true);
   }
 
   /**
@@ -512,18 +680,63 @@ export class Conversation {
     }
   }
 
-  /** Asks for a person at the Company (spec 8.9). */
-  async handoff(): Promise<{ status: ConversationStatus; responder: Responder }> {
-    const update = this.apply(
-      await this.#conversations.request("POST", `${this.#url}/handoff`, {}),
-    );
-    return { status: update.status, responder: update.responder };
+  /** A POST with only a request id, which 0.4 requires on every conversation request (spec 8.3). */
+  #idBody(id: string | undefined, prefix: string): Record<string, unknown> {
+    return this.#conversations.session.company.protocolVersion === "0.3"
+      ? {}
+      : { id: requestId(id, prefix) };
   }
 
-  /** Closes the conversation (spec 8.12). Doesn't cancel anything it started. */
-  async close(): Promise<{ status: ConversationStatus; responder: Responder }> {
-    const update = this.apply(await this.#conversations.request("POST", `${this.#url}/close`, {}));
-    return { status: update.status, responder: update.responder };
+  /**
+   * Asks for a person at the Company (spec 8.9). The Company accepts the request and acts on it after
+   * responding, so read until `working` is false to see `handoff` and `responder` settle.
+   */
+  async handoff(options: { id?: string } = {}): Promise<Conversation["state"]> {
+    this.apply(
+      await this.#conversations.request(
+        "POST",
+        `${this.#url}/handoff`,
+        this.#idBody(options.id, "hnd_"),
+      ),
+      true,
+    );
+    return this.state;
+  }
+
+  /**
+   * Withdraws a request for a person (spec 8.9), from 0.4. The Company MAY stop looking or keep looking,
+   * and a person may join before it acts on the cancel, so read `handoff` and `responder` for the
+   * outcome rather than depending on the cancel taking effect.
+   */
+  async cancelHandoff(options: { id?: string } = {}): Promise<Conversation["state"]> {
+    if (this.#conversations.session.company.protocolVersion === "0.3")
+      throw new PoppyProtocolError("withdrawing a handoff needs protocol version 0.4 or later");
+    this.apply(
+      await this.#conversations.request(
+        "POST",
+        `${this.#url}/handoff/cancel`,
+        this.#idBody(options.id, "hnc_"),
+      ),
+      true,
+    );
+    return this.state;
+  }
+
+  /**
+   * Closes the conversation (spec 8.12). Doesn't cancel anything it started.
+   *
+   * From 0.4 a close doesn't wait its turn: the Company MAY act on requests it hasn't acted on yet, or
+   * drop them, so read until `working` is false before closing to be sure it acted on everything sent.
+   */
+  async close(options: { id?: string } = {}): Promise<Conversation["state"]> {
+    this.apply(
+      await this.#conversations.request(
+        "POST",
+        `${this.#url}/close`,
+        this.#idBody(options.id, "cls_"),
+      ),
+    );
+    return this.state;
   }
 
   /**
@@ -582,18 +795,25 @@ export class Conversation {
       } else {
         const json: unknown = await response.json().catch(() => undefined);
         if (!isObject(json)) throw new PoppyProtocolError("events response must be a JSON object");
+        // A Company that doesn't stream reports `working` in each read's body rather than as an
+        // event, so changes to it are turned back into `working` items here (spec 8.6, 8.7).
+        let working = this.#state.working;
         let update = this.apply(json);
+        if (update.working !== working) yield { type: "working", working: update.working };
+        working = update.working;
         for (const event of update.events) yield { type: "event", event };
-        while ((update.hasMore || update.status !== "closed") && !signal?.aborted) {
+        while ((update.hasMore || !update.closed) && !signal?.aborted) {
           update = await this.read({
             wait: update.hasMore ? 0 : POLL_WAIT,
             ...(signal === undefined ? {} : { signal }),
           });
+          if (update.working !== working) yield { type: "working", working: update.working };
+          working = update.working;
           for (const event of update.events) yield { type: "event", event };
         }
         return;
       }
-      if (this.#status === "closed") return;
+      if (this.#state.closed) return;
       if (!progressed) await sleep(RECONNECT_DELAY, signal).catch(() => undefined);
     }
   }
@@ -653,6 +873,12 @@ export class Conversation {
       )
         return undefined;
       return { type: "text-delta", messageId: json["message_id"], text: json["text"] };
+    }
+    // From 0.4, working arrives as its own event with no SSE id, since it isn't recorded (spec 8.6).
+    if (eventName === "working") {
+      if (!isObject(json) || typeof json["working"] !== "boolean") return undefined;
+      this.#state.working = json["working"];
+      return { type: "working", working: json["working"] };
     }
     if (eventName !== "" && eventName !== "message") return undefined;
     const before = this.#seen.size;

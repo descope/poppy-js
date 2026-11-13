@@ -33,6 +33,18 @@ export async function fetchSkill(
 ): Promise<SkillArtifact> {
   const skill = company.skills.find((entry) => entry.name === name);
   if (skill === undefined) throw new PoppyProtocolError(`${company.domain} lists no skill ${name}`);
+  return fetchSkillArtifact(skill, options);
+}
+
+/**
+ * Fetches one skill and checks its `digest` (spec 9.4), wherever its index came from: `poppy.json` on
+ * 0.3, or a Session's response from `tasks.endpoint` on 0.4. Carries no credential, as {@link fetchSkill}
+ * describes.
+ */
+export async function fetchSkillArtifact(
+  skill: Skill,
+  options: FetchSkillOptions = {},
+): Promise<SkillArtifact> {
   const bytes = await getBytes(
     options.fetch ?? fetch,
     new URL(skill.url),
@@ -42,7 +54,7 @@ export async function fetchSkill(
   const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes as BufferSource));
   const hex = [...digest].map((byte) => byte.toString(16).padStart(2, "0")).join("");
   if (`sha256:${hex}` !== skill.digest)
-    throw new PoppyProtocolError(`skill ${name} doesn't match its digest`);
+    throw new PoppyProtocolError(`skill ${skill.name} doesn't match its digest`);
   return {
     skill,
     bytes,

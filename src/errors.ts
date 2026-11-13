@@ -8,6 +8,7 @@ export type PoppyErrorCode =
   | "unsupported_grant_type"
   | "invalid_session"
   | "session_ended"
+  | "version_unsupported"
   | "unauthorized_client"
   | "invalid_token"
   | "insufficient_scope"
@@ -25,6 +26,8 @@ export type PoppyErrorCode =
   | "conversation_closed"
   | "direct_conversation_open"
   | "message_id_conflict"
+  | "request_id_conflict"
+  | "version_mismatch"
   | "invalid_cursor"
   | "cursor_expired"
   | "protocol_error"
@@ -37,6 +40,7 @@ export interface PoppyErrorOptions {
   extension?: string | undefined;
   conversationId?: string | undefined;
   scope?: string | undefined;
+  protocolVersion?: string | undefined;
 }
 
 /**
@@ -57,6 +61,8 @@ export class PoppyError extends Error {
   readonly conversationId: string | undefined;
   /** The scopes a request needs, on `insufficient_scope` (spec 7). */
   readonly scope: string | undefined;
+  /** The version a conversation started in, on `version_mismatch` (spec 8.2, 8.13). */
+  readonly protocolVersion: string | undefined;
 
   constructor(error: PoppyErrorCode, options: PoppyErrorOptions = {}) {
     super(options.description ? `${error}: ${options.description}` : error);
@@ -67,6 +73,7 @@ export class PoppyError extends Error {
     this.extension = options.extension;
     this.conversationId = options.conversationId;
     this.scope = options.scope;
+    this.protocolVersion = options.protocolVersion;
   }
 }
 
@@ -113,6 +120,7 @@ export function errorFromBody(body: unknown, response: Response): PoppyError {
     extension: stringField(body, "extension"),
     conversationId: stringField(body, "conversation_id"),
     scope: stringField(body, "scope"),
+    protocolVersion: stringField(body, "protocol_version"),
   });
   if (typeof body === "object" && body !== null && !Array.isArray(body))
     errorBodies.set(error, body as Record<string, unknown>);

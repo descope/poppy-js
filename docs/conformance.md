@@ -1,6 +1,6 @@
 # Conformance
 
-The spec project's validator tests Companies. This suite tests the other side: it checks a Personal Agent against the rules spec draft 0.3 sets for Personal Agents, and reports each one as passed, failed or skipped. It's meant for any Personal Agent SDK or agent, not just this one, and this SDK passes every check.
+The spec project's validator tests Companies. This suite tests the other side: it checks a Personal Agent against the rules spec 0.4 and 0.3 set for Personal Agents, and reports each one as passed, failed or skipped. It's meant for any Personal Agent SDK or agent, not just this one, and this SDK passes every check.
 
 There are two ways to run it:
 
@@ -74,7 +74,7 @@ The conformance Company fetches your agent's client metadata and key set from it
 The output looks like this:
 
 ```text
-Personal Agent Protocol 0.3 conformance: 32 passed, 0 failed, 0 skipped
+Personal Agent Protocol 0.4 and 0.3 conformance: 50 passed, 0 failed, 0 skipped
 PASS  MUST   4.1           identity.metadata
 PASS  MUST   3             discovery.well-known-path
 ...

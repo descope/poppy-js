@@ -1,3 +1,4 @@
+import { SUPPORTED_PROTOCOL_VERSIONS } from "../discovery.ts";
 import { CHECKS, type Check } from "./checks.ts";
 import { ConformanceCompany } from "./company.ts";
 import { SCENARIOS, type ScenarioDefinition, type Step } from "./scenarios.ts";
@@ -25,6 +26,18 @@ export interface AgentDriver {
   converse?(text: string): Promise<void>;
   /** Sends a request the Company refuses with `approval_required`, approves it, and retries. */
   requestWithApproval?(url: string, init: { method: string; body: string }): Promise<number>;
+  /** Reads the Company's task coverage for this Session: excluded tasks, skills and feedback. */
+  taskCoverage?(): Promise<void>;
+  /** Reports a task the User couldn't do, to the feedback endpoint the Company names. */
+  reportTask?(report: { task: string; description: string }): Promise<void>;
+  /** Joins the agent's OWN browser to the Session (section 6), never the User's. */
+  joinBrowser?(): Promise<void>;
+  /** Fetches a page of the Company's website with the agent's own HTTP client (5.2). */
+  fetchPage?(url: string): Promise<void>;
+  /** Starts a conversation, asks for a person, then withdraws the request (8.9). */
+  handoffThenCancel?(text: string): Promise<void>;
+  /** Fetches one of the Company's skills and checks it against its digest (9.4). */
+  readSkill?(name: string): Promise<void>;
 }
 
 /** Makes a fresh agent, with no state, that sends all of its HTTP through `fetch`. */
@@ -64,8 +77,8 @@ export interface CheckResult extends Check {
 }
 
 export interface ConformanceReport {
-  /** The spec draft the suite checks. */
-  protocolVersion: "0.3";
+  /** The spec versions the suite checks, newest first. */
+  protocolVersions: readonly string[];
   scenarios: ScenarioResult[];
   /** Every check, across all scenarios: failed if any scenario failed it. */
   results: CheckResult[];
@@ -107,7 +120,7 @@ export function summarize(scenarios: ScenarioResult[]): ConformanceReport {
     };
   });
   return {
-    protocolVersion: "0.3",
+    protocolVersions: SUPPORTED_PROTOCOL_VERSIONS,
     scenarios,
     results,
     passed: results.filter((r) => r.status === "pass").length,
@@ -149,6 +162,25 @@ async function runStep(
         throw new Error("the driver has no requestWithApproval()");
       await driver.requestWithApproval(step.url, { method: step.method, body: step.body });
       return;
+    case "task_coverage":
+      if (driver.taskCoverage === undefined) throw new Error("the driver has no taskCoverage()");
+      return driver.taskCoverage();
+    case "report_task":
+      if (driver.reportTask === undefined) throw new Error("the driver has no reportTask()");
+      return driver.reportTask({ task: step.task, description: step.description });
+    case "join_browser":
+      if (driver.joinBrowser === undefined) throw new Error("the driver has no joinBrowser()");
+      return driver.joinBrowser();
+    case "fetch_page":
+      if (driver.fetchPage === undefined) throw new Error("the driver has no fetchPage()");
+      return driver.fetchPage(step.url);
+    case "handoff_then_cancel":
+      if (driver.handoffThenCancel === undefined)
+        throw new Error("the driver has no handoffThenCancel()");
+      return driver.handoffThenCancel(step.text);
+    case "read_skill":
+      if (driver.readSkill === undefined) throw new Error("the driver has no readSkill()");
+      return driver.readSkill(step.name);
   }
 }
 
@@ -193,7 +225,7 @@ export function formatReport(report: ConformanceReport): string {
     return r.status === "pass" ? line : `${line}\n        ${r.details.join("\n        ")}`;
   });
   return [
-    `Personal Agent Protocol ${report.protocolVersion} conformance: ${report.passed} passed, ${report.failed} failed, ${report.skipped} skipped`,
+    `Personal Agent Protocol ${report.protocolVersions.join(" and ")} conformance: ${report.passed} passed, ${report.failed} failed, ${report.skipped} skipped`,
     ...lines,
   ].join("\n");
 }

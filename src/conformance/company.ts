@@ -1,16 +1,34 @@
 import { decodeJwt, sha256, thumbprint } from "../jose.ts";
 
 /**
- * A strict Company for testing Personal Agents. It serves draft 0.3 discovery, an OAuth issuer, an
+ * A strict Company for testing Personal Agents. It serves discovery at 0.3 or 0.4, an OAuth issuer, an
  * OpenAPI API, an MCP server and conversations, as a `fetch` the agent under test sends everything
  * through. It verifies every request against the rules the spec sets for Personal Agents, and records
  * which checks passed and which failed.
+ *
+ * A scenario's `version` says which protocol version the Company serves, and the Company then holds the
+ * agent to that version's rules: 0.4 wants `Poppy-Version` on every request with the Session header,
+ * task coverage from `tasks.endpoint`, and a request id on every conversation POST.
  */
 export const ORIGIN = "https://shop.test";
 export const ISSUER = ORIGIN;
 export const API = `${ORIGIN}/api`;
 export const MCP = "https://mcp.shop.test/mcp";
 export const CONVERSATIONS = `${ORIGIN}/poppy/conversations`;
+/** Where a 0.4 Company serves a Session's excluded tasks, skills and feedback endpoint (spec 9). */
+export const TASKS = `${ORIGIN}/poppy/tasks`;
+export const FEEDBACK = `${ORIGIN}/poppy/feedback`;
+/** Where the agent's own browser joins a Session (spec section 6). */
+export const BROWSER_SESSION = `${ORIGIN}/poppy/browser-session`;
+/** A page of the Company's website, which 0.4 has an agent fetch with the Session header (5.2). */
+export const PAGE = `${ORIGIN}/help/returns`;
+/** The one skill the Company publishes, and the bytes its digest covers (spec 9.4). */
+export const SKILL_URL = `${ORIGIN}/skills/returns/SKILL.md`;
+export const SKILL_BODY = "# Returns\n\nAsk the Company Agent, then call the exchanges API.\n";
+/** The scope a signed-in browser join needs, from 0.4 (spec 4.7, section 6). */
+const BROWSER_SIGN_IN = "poppy:browser-sign-in";
+/** Where this Company serves the document for the version it doesn't prefer (spec 3.4). */
+const OTHER_VERSION_DOC = `${ORIGIN}/poppy/other-version.json`;
 const TOKEN = `${ORIGIN}/oauth/token`;
 const REVOKE = `${ORIGIN}/oauth/revoke`;
 const AUTHORIZE = `${ORIGIN}/oauth/authorize`;
@@ -19,6 +37,25 @@ const ID = /^[A-Za-z0-9_-]{1,256}$/;
 
 /** Behaviors a scenario switches on, to see how the agent reacts. */
 export interface Scenario {
+  /** The protocol version the Company serves and holds the agent to. Defaults to 0.3. */
+  version?: "0.3" | "0.4";
+  /**
+   * poppy.json is the document for the other version, and `supported_versions` links to `version`'s
+   * document (spec 3.4). The agent has to follow the link when `version` is the newer of the two.
+   */
+  linkPreferredVersion?: boolean;
+  /** `supported_versions` links 0.4 to a document on another host, which the agent must not use. */
+  linkedVersionOffsite?: boolean;
+  /** The linked document declares a version other than the one it is listed under, so it's unusable. */
+  linkedVersionMismatch?: boolean;
+  /** Every request with the Session header is refused with version_unsupported. */
+  versionUnsupported?: boolean;
+  /** The conversation refuses everything with version_mismatch, as one started elsewhere would. */
+  versionMismatch?: boolean;
+  /** The Company Agent keeps working over the first read of a conversation, then stops. */
+  slowAgent?: boolean;
+  /** A website page refuses the Session header once, so the agent asks again without it. */
+  pageRejectsSession?: boolean;
   /** www.shop.test redirects poppy.json to an uploaded file. */
   redirectToUpload?: boolean;
   /** organization.domain names another host. */
@@ -67,6 +104,13 @@ function json(status: number, body: unknown, headers: Record<string, string> = {
   return new Response(JSON.stringify(body), {
     status,
     headers: { "content-type": "application/json", ...headers },
+  });
+}
+
+function html(): Response {
+  return new Response("<html>ok</html>", {
+    status: 200,
+    headers: { "content-type": "text/html" },
   });
 }
 
@@ -127,7 +171,17 @@ export class ConformanceCompany {
   readonly #kidToSub = new Map<string, string>();
   readonly #sidIds = new Map<string, string>();
   readonly #endedSids = new Set<string>();
+  readonly #sidVersions = new Map<string, string>();
+  #browserCode: string | undefined;
+  #signInRefused = false;
+  #codeIssued = false;
+  #codeAuthorized = false;
+  #pageRefused = false;
+  #handoff: "none" | "pending" = "none";
+  #reads = 0;
+  #mismatches = 0;
   #sessionErrors = 0;
+  #versionErrors = 0;
   readonly #codes = new Map<string, { challenge: string; scope: string[]; redirectUri: string }>();
   readonly #access = new Map<string, Issued>();
   readonly #refresh = new Map<string, Issued>();
@@ -227,17 +281,52 @@ export class ConformanceCompany {
 
   // ---------- Discovery ----------
 
-  poppyJson(): Record<string, unknown> {
+  /** The version this Company serves, which its documents and its checks follow (spec 3.4). */
+  get version(): "0.3" | "0.4" {
+    return this.scenario.version ?? "0.3";
+  }
+
+  /** The version it serves at the other document, when the scenario has two (spec 3.4). */
+  get #otherVersion(): "0.3" | "0.4" {
+    return this.version === "0.3" ? "0.4" : "0.3";
+  }
+
+  /** Whether the agent should end up on `version` rather than on the other document's version. */
+  get #servesTwoVersions(): boolean {
+    return (
+      this.scenario.linkPreferredVersion === true ||
+      this.scenario.linkedVersionOffsite === true ||
+      this.scenario.linkedVersionMismatch === true
+    );
+  }
+
+  /** A document for one version, without the `supported_versions` that only poppy.json carries. */
+  #document(version: "0.3" | "0.4"): Record<string, unknown> {
+    const taskCoverage =
+      version === "0.3"
+        ? {
+            feedback: { endpoint: FEEDBACK },
+            excluded_tasks: { url: `${ORIGIN}/poppy/excluded-tasks.json` },
+            skill_index: this.skillIndex(),
+          }
+        : { tasks: { endpoint: TASKS } };
     return {
-      protocol_version: this.scenario.futureVersion ? "9.9" : "0.3",
+      protocol_version: this.scenario.futureVersion ? "9.9" : version,
       organization: {
         name: "Conformance Shop",
         domain: this.scenario.wrongDomain ? "other.test" : "shop.test",
       },
       auth: {
-        scopes: { "orders:read": "See your orders", "orders:write": "Change your orders" },
+        scopes: {
+          "orders:read": "See your orders",
+          "orders:write": "Change your orders",
+          ...(version === "0.3"
+            ? {}
+            : { [BROWSER_SIGN_IN]: "Use the website signed in, with the access you approve" }),
+        },
         scope_hints: { "orders:read": { changes: "none", personal_data: true } },
       },
+      web: { browser_session_endpoint: BROWSER_SESSION },
       agent: { protocols: [{ type: "poppy", endpoint: CONVERSATIONS }] },
       apis: [
         { type: "openapi", url: `${ORIGIN}/openapi.json`, description: "Orders" },
@@ -246,8 +335,48 @@ export class ConformanceCompany {
           ? [{ type: "openapi", url: "https://127.0.0.1/openapi.json" }]
           : []),
       ],
-      extensions: { operations: { version: "2" } },
+      ...taskCoverage,
+      // 0.4 lists an entry per major version; 0.3 lists one entry (spec 3.3).
+      extensions: {
+        operations: version === "0.3" ? { version: "2" } : [{ version: "2" }],
+      },
     };
+  }
+
+  /** The Agent Skills index this Company publishes, with the digest of the bytes it serves (9.4). */
+  skillIndex(): Record<string, unknown> {
+    return {
+      $schema: "https://schemas.agentskills.io/discovery/0.2.0/schema.json",
+      skills: [
+        {
+          name: "returns",
+          description: "How to return an item with this Company.",
+          type: "skill-md",
+          url: SKILL_URL,
+          digest: "sha256:f6d76ac5292b338b8a3bb4d4dbd7ca660c3f43068a15ad5e5c2de4d950ed916f",
+        },
+      ],
+    };
+  }
+
+  /** What `${ORIGIN}/.well-known/poppy.json` serves. */
+  poppyJson(): Record<string, unknown> {
+    if (!this.#servesTwoVersions) return this.#document(this.version);
+    // poppy.json is the other version's document, and links to the one the agent should choose.
+    const link = this.scenario.linkedVersionOffsite
+      ? "https://other.test/poppy/0.4.json"
+      : OTHER_VERSION_DOC;
+    return {
+      ...this.#document(this.#otherVersion),
+      supported_versions: { [this.version]: link },
+    };
+  }
+
+  /** The linked document, which carries the version it was listed under and no links of its own. */
+  #linkedDocument(): Record<string, unknown> {
+    const document = this.#document(this.version);
+    if (this.scenario.linkedVersionMismatch) document["protocol_version"] = this.#otherVersion;
+    return document;
   }
 
   #metadata(): Record<string, unknown> {
@@ -257,7 +386,7 @@ export class ConformanceCompany {
       revocation_endpoint: REVOKE,
       authorization_endpoint: AUTHORIZE,
       grant_types_supported: ["refresh_token", "authorization_code"],
-      scopes_supported: ["orders:read", "orders:write"],
+      scopes_supported: ["orders:read", "orders:write", BROWSER_SIGN_IN],
       protected_resources: this.scenario.issuerUnlinked ? [MCP] : [ORIGIN, MCP],
       ...(this.scenario.dpop ? { dpop_signing_alg_values_supported: ["ES256"] } : {}),
     };
@@ -284,6 +413,51 @@ export class ConformanceCompany {
       case `${ORIGIN}/.well-known/poppy.json`:
       case `${ORIGIN}/uploads/poppy.json`:
         return json(200, this.poppyJson());
+      case OTHER_VERSION_DOC:
+        return json(200, this.#linkedDocument());
+      case `${ORIGIN}/poppy/excluded-tasks.json`:
+        // 0.3 serves excluded tasks as a public document, with no Session header (spec 9.1).
+        if (headers.has("poppy-session"))
+          this.fail(
+            "session.destinations",
+            "sent the Session header to the excluded tasks document",
+          );
+        return json(200, { tasks: [{ task: "Send a wire transfer" }] });
+      case TASKS:
+        return this.#resource(request, undefined, undefined, () => this.#tasks(request));
+      case SKILL_URL:
+        // A skill artifact is Company content: it carries no credential, wherever it lives (9.4).
+        if (headers.has("poppy-session") || headers.has("authorization"))
+          this.fail("tasks.skill-digest", "sent a credential when fetching a skill artifact");
+        else this.pass("tasks.skill-digest");
+        return new Response(SKILL_BODY, {
+          status: 200,
+          headers: { "content-type": "text/markdown" },
+        });
+      case BROWSER_SESSION:
+        // Step 1: the agent's own browser loads the page and gets a one-time code (section 6).
+        this.#browserCode = `bc_${++this.#counter}`;
+        this.#codeIssued = true;
+        return new Response(
+          `<form method="POST" action="${BROWSER_SESSION}/submit"><input type="hidden" name="code" value="${this.#browserCode}"></form>`,
+          { status: 200, headers: { "content-type": "text/html" } },
+        );
+      case `${BROWSER_SESSION}/authorize`:
+        return this.#resource(request, undefined, undefined, () => this.#authorizeBrowser(request));
+      case `${BROWSER_SESSION}/submit`:
+        if (!this.#codeAuthorized)
+          this.fail("browser.join", "submitted the form before authorizing the code");
+        else this.pass("browser.join");
+        return new Response(null, { status: 303, headers: { location: ORIGIN } });
+      case PAGE:
+        return this.#page(request);
+      case FEEDBACK:
+        return this.#resource(request, undefined, undefined, () => {
+          if (headers.has("authorization"))
+            this.fail("tasks.feedback", "sent an access token with a feedback report");
+          else this.pass("tasks.feedback");
+          return new Response(null, { status: 202 });
+        });
       case `${ORIGIN}/.well-known/oauth-protected-resource`:
         if (this.scenario.resourceMetadataFails) return json(500, { error: "unavailable" });
         return json(200, { resource: ORIGIN, authorization_servers: [ISSUER] });
@@ -578,6 +752,8 @@ export class ConformanceCompany {
     this.pass("session.header");
     const session = await this.#verifySession(jwt, method, url);
     if (session === undefined) return json(400, { error: "invalid_session" });
+    const version = this.#checkVersion(headers, String(session.payload["sid"]));
+    if (version !== undefined) return version;
 
     const authorization = headers.get("authorization");
     const [scheme, value] = authorization?.split(" ") ?? [];
@@ -633,6 +809,55 @@ export class ConformanceCompany {
       return challenge("Bearer", `scope="${scope}"`, resource);
     }
     return handler();
+  }
+
+  /**
+   * Checks `Poppy-Version` and `Poppy-Extensions` on a request with the Session header (spec 3.4).
+   * Returns a response when the request can't be handled under a version this Company serves.
+   *
+   * 0.3 defines neither header, so the Company only records what it sees. From 0.4 it rejects a missing
+   * or unserved version with `version_unsupported`, and the agent chooses again.
+   */
+  #checkVersion(headers: Headers, sid: string): Response | undefined {
+    if (this.scenario.versionUnsupported === true) {
+      this.#versionErrors++;
+      return json(400, { error: "version_unsupported" });
+    }
+    // Every version this Company has a document for. A scenario that serves two accepts either, since
+    // which one the agent may use is what the scenario is testing.
+    const served: string[] = this.#servesTwoVersions
+      ? [this.version, this.#otherVersion]
+      : [this.version];
+    const declared = headers.get("poppy-version");
+    if (declared === null) {
+      // 0.3 defines no Poppy-Version, so a request without one belongs to 0.3 (spec 3.4). This
+      // scenario's checks don't cover the header when the agent is working at 0.3.
+      if (served.includes("0.3")) return undefined;
+      this.fail("versions.header", "no Poppy-Version on a request with the Session header");
+      return json(400, { error: "version_unsupported" });
+    }
+    if (!served.includes(declared) || declared === "0.3") {
+      this.fail("versions.header", `Poppy-Version ${declared} isn't a version the Company serves`);
+      return json(400, { error: "version_unsupported" });
+    }
+    const known = this.#sidVersions.get(sid);
+    if (known !== undefined && known !== declared)
+      this.fail("versions.header", "a Session's Poppy-Version changed");
+    else this.pass("versions.header");
+    this.#sidVersions.set(sid, declared);
+
+    // Extensions are declared per request from 0.4, not in the client metadata document (spec 3.3).
+    const extensions = headers.get("poppy-extensions");
+    if (extensions !== null) {
+      // Split first, then check each member: one pass over the value, with no nested quantifier for
+      // a crafted header to make backtrack (RFC 9651 section 4.2).
+      const members = extensions.split(",");
+      if (members.every((member) => /^\s*"[^"]+";v="[^"]+"\s*$/.test(member)))
+        this.pass("extensions.declared");
+      else
+        this.fail("extensions.declared", `Poppy-Extensions isn't an RFC 9651 List: ${extensions}`);
+    }
+    return undefined;
   }
 
   async #verifySession(jwt: string, method: string, url: URL) {
@@ -728,6 +953,80 @@ export class ConformanceCompany {
     return decoded;
   }
 
+  /** The distinct `Poppy-Version` values the agent sent with the Session header (spec 3.4). */
+  declaredVersions(): string[] {
+    return [
+      ...new Set(
+        this.requests
+          .filter((r) => r.headers.has("poppy-session"))
+          .map((r) => r.headers.get("poppy-version"))
+          .filter((version): version is string => version !== null),
+      ),
+    ];
+  }
+
+  /**
+   * Decides the version-selection checks for a scenario that serves two documents (spec 3.4). The
+   * Company prefers one version in `poppy.json` and links the other; which one the agent ends up on
+   * shows in the document it fetched and the version it names on its requests.
+   */
+  checkVersionSelection(): void {
+    const linked = this.requests.some(
+      (r) => `${r.url.origin}${r.url.pathname}` === OTHER_VERSION_DOC,
+    );
+    const declared = this.declaredVersions();
+    if (this.scenario.linkedVersionOffsite === true) {
+      // The linked document is on another host, so the agent must not fetch or use it (spec 3.4).
+      if (this.requests.some((r) => r.url.hostname === "other.test"))
+        this.fail("versions.linked-host", "fetched a supported_versions document on another host");
+      else if (declared.includes(this.version))
+        this.fail("versions.linked-host", `used the ${this.version} document it must have refused`);
+      else this.pass("versions.linked-host");
+      return;
+    }
+    if (this.scenario.linkedVersionMismatch === true) {
+      // The linked document declares another version, so nothing in it may be used (spec 3.4).
+      if (declared.includes(this.version))
+        this.fail(
+          "versions.linked-version",
+          `used a document listed under ${this.version} that declares ${this.#otherVersion}`,
+        );
+      else this.pass("versions.linked-version");
+      return;
+    }
+    if (!linked) this.fail("versions.selection", "didn't fetch the newer version's document");
+    else if (!declared.includes(this.version))
+      this.fail(
+        "versions.selection",
+        `chose ${declared.join(", ") || "no version"} rather than the newer ${this.version}`,
+      );
+    else this.pass("versions.selection");
+  }
+
+  /** Called by the runner after a version_mismatch scenario (spec 8.13). */
+  checkVersionMismatch(): void {
+    if (this.#mismatches === 0) return;
+    // The conversation can't continue in these versions, so an agent stops rather than hammering it.
+    if (this.#mismatches > 2)
+      this.fail("conversation.version-mismatch", "kept sending after version_mismatch");
+    else this.pass("conversation.version-mismatch");
+  }
+
+  /** Called by the runner after a version_unsupported scenario (spec 3.4). */
+  checkVersionErrors(): void {
+    // The Company serves no version the agent can use, so it fetches poppy.json again, finds the same
+    // answer, and stops. One retry is allowed; more means it kept going.
+    const discoveries = this.requests.filter(
+      (r) => `${r.url.origin}${r.url.pathname}` === `${ORIGIN}/.well-known/poppy.json`,
+    ).length;
+    if (this.#versionErrors === 0) return;
+    if (this.#versionErrors > 2)
+      this.fail("versions.unsupported", "kept sending the request after version_unsupported");
+    else if (discoveries < 2)
+      this.fail("versions.unsupported", "didn't fetch poppy.json again after version_unsupported");
+    else this.pass("versions.unsupported");
+  }
+
   /** Called by the runner after a session_ended or invalid_session scenario (spec 5.3, 5.5). */
   checkSessionErrors(requestsTo: string): void {
     const attempts = this.requests.filter((r) => `${r.url.origin}${r.url.pathname}` === requestsTo);
@@ -747,6 +1046,110 @@ export class ConformanceCompany {
         this.fail("session.invalid-session", "sent the request again after invalid_session");
       else if (this.#sessionErrors === 1) this.pass("session.invalid-session");
     }
+  }
+
+  // ---------- Browser join and website pages ----------
+
+  /**
+   * Step 2 of a browser join (section 6): the agent authorizes the code its own browser was given,
+   * with the Session header and, if signed in, its access token.
+   *
+   * From 0.4 a signed-in join needs `poppy:browser-sign-in`, and a token without it is refused with
+   * `insufficient_scope` — the agent then joins signed out, or asks for the scope and starts again.
+   */
+  #authorizeBrowser({ body, headers }: Recorded): Response {
+    let code: unknown;
+    try {
+      code = (JSON.parse(body || "{}") as Record<string, unknown>)["code"];
+    } catch {
+      return json(400, { error: "invalid_request" });
+    }
+    // A code the agent did not read from its own browser's page.
+    if (typeof code !== "string" || !this.#codeIssued || code !== this.#browserCode) {
+      this.fail(
+        "browser.code-source",
+        `authorized a code this browser was never given: ${String(code)}`,
+      );
+      return json(400, { error: "invalid_request" });
+    }
+    this.pass("browser.code-source");
+    const token = headers.get("authorization")?.split(" ")[1];
+    if (token !== undefined && this.version !== "0.3") {
+      const issued = this.#access.get(token);
+      if (issued?.scope.includes(BROWSER_SIGN_IN) !== true) {
+        this.#signInRefused = true;
+        return challenge(
+          "Bearer",
+          `error="insufficient_scope", scope="${BROWSER_SIGN_IN}"`,
+          undefined,
+        );
+      }
+      this.pass("browser.sign-in-scope");
+    } else if (this.version !== "0.3" && this.#signInRefused) {
+      // It came back without a token after the refusal, which is one of the two allowed answers.
+      this.pass("browser.sign-in-scope");
+    }
+    this.#codeAuthorized = true;
+    return new Response(null, { status: 204 });
+  }
+
+  /**
+   * A page of the Company's website. From 0.4 an agent that fetches one with its own HTTP client
+   * sends the Session header and never a token, so the request is signed out (5.2).
+   */
+  async #page({ method, url, headers }: Recorded): Promise<Response> {
+    const jwt = headers.get("poppy-session");
+    if (headers.has("authorization")) {
+      this.fail("web.page-signed-out", "sent an access token with a website page request");
+      return json(400, { error: "invalid_session" });
+    }
+    this.pass("web.page-signed-out");
+    if (this.version === "0.3") return html();
+    if (jwt === null) {
+      // Allowed only as the second try, after this Company refused the header once (5.2, 5.6).
+      if (this.#pageRefused) this.pass("web.page-session");
+      else this.fail("web.page-session", `no Session header on ${method} ${url.pathname}`);
+      return html();
+    }
+    if (this.scenario.pageRejectsSession === true && !this.#pageRefused) {
+      this.#pageRefused = true;
+      return json(400, { error: "invalid_session" });
+    }
+    // The same verification a resource gets: signature, delegation, claims, htm and htu. A header
+    // that doesn't verify is not a Session header, and an agent sending one isn't conformant.
+    const session = await this.#verifySession(jwt, method, url);
+    if (session === undefined) {
+      this.fail("web.page-session", "a page's Session header didn't verify");
+      return json(400, { error: "invalid_session" });
+    }
+    if (session.payload["ath"] !== undefined)
+      this.fail("web.page-signed-out", "a page's Session JWT carried ath");
+    else this.pass("web.page-session");
+    return html();
+  }
+
+  // ---------- Task coverage ----------
+
+  /**
+   * The 0.4 tasks response (spec section 9). It describes what the Company offers, not the account, so
+   * the request carries the Session header and no access token, even in a signed-in Session.
+   */
+  #tasks({ method, headers }: Recorded): Response {
+    if (method !== "GET") {
+      this.fail("tasks.session", `fetched tasks.endpoint with ${method}, not GET`);
+      return json(405, { error: "invalid_request" });
+    }
+    if (headers.has("authorization"))
+      this.fail("tasks.session", "sent an access token to tasks.endpoint");
+    else this.pass("tasks.session");
+    return json(
+      200,
+      {
+        excluded_tasks: [{ task: "Send a wire transfer" }],
+        feedback: { endpoint: FEEDBACK },
+      },
+      { "cache-control": "private" },
+    );
   }
 
   // ---------- Operations ----------
@@ -792,26 +1195,51 @@ export class ConformanceCompany {
     } catch {
       return json(400, { error: "invalid_request" });
     }
+    const isV4 = this.version !== "0.3";
+    if (this.scenario.versionMismatch === true && rest.length > 0) {
+      this.#mismatches++;
+      return json(409, { error: "version_mismatch", protocol_version: "0.3" });
+    }
     const message = payload["message"] as Record<string, unknown> | undefined;
+    /**
+     * Checks the ID a POST carries (spec 8.2, 8.3). On 0.3 the message carries its own; from 0.4 the
+     * request carries a top-level one and the message has none, so a retry of any request is safe.
+     */
+    const checkRequestId = (): string | undefined => {
+      const id = isV4 ? payload["id"] : message?.["id"];
+      const check = isV4 ? "conversation.request-id" : "conversation.messages";
+      if (typeof id !== "string" || !ID.test(id)) {
+        this.fail(check, isV4 ? "a request id is missing or invalid" : "a message id is invalid");
+        return undefined;
+      }
+      if (isV4 && message?.["id"] !== undefined) {
+        this.fail(check, "a 0.4 message carried an id of its own, rather than its request's");
+        return undefined;
+      }
+      if (this.#messageIds.has(id)) {
+        this.fail(check, "a request id was reused");
+        return undefined;
+      }
+      this.#messageIds.add(id);
+      this.pass(check);
+      return id;
+    };
     const checkMessage = (): boolean => {
-      const id = message?.["id"];
+      if (checkRequestId() === undefined) return false;
       const author = message?.["author"] as { type?: unknown } | undefined;
       const hasContent = ["text", "data", "context", "extensions"].some(
         (key) => message?.[key] !== undefined,
       );
-      if (typeof id !== "string" || !ID.test(id))
-        this.fail("conversation.messages", "a message id is invalid");
-      else if (author?.type !== "agent" && author?.type !== "human")
+      if (author?.type !== "agent" && author?.type !== "human") {
         this.fail("conversation.messages", "a message has no author.type");
-      else if (!hasContent) this.fail("conversation.messages", "a message has no content");
-      else if (this.#messageIds.has(id))
-        this.fail("conversation.messages", "a message id was reused");
-      else {
-        this.#messageIds.add(id);
-        this.pass("conversation.messages");
-        return true;
+        return false;
       }
-      return false;
+      if (!hasContent) {
+        this.fail("conversation.messages", "a message has no content");
+        return false;
+      }
+      this.pass("conversation.messages");
+      return true;
     };
     const reply = (id: string) => ({
       id: `evt_${++this.#counter}`,
@@ -824,20 +1252,35 @@ export class ConformanceCompany {
         text: `Reply in ${id}`,
       },
     });
+    // 0.3 reports one status; 0.4 reports four independent fields (spec 8.7).
+    const working = this.scenario.slowAgent === true && this.#reads === 0;
+    const state = (closed = false) =>
+      isV4
+        ? { working, handoff: this.#handoff, responder: "agent", closed }
+        : { status: closed ? "closed" : working ? "working" : "idle", responder: "agent" };
     if (rest.length === 0 && method === "POST") {
       if (!checkMessage()) return json(400, { error: "invalid_request" });
       const id = `cnv_${++this.#counter}`;
       this.#conversations.set(id, { events: [reply(id)] });
-      return json(201, { conversation_id: id, status: "idle", responder: "agent" });
+      // A 0.4 POST without wait answers with only the conversation_id (spec 8.3).
+      return json(201, isV4 ? { conversation_id: id } : { conversation_id: id, ...state() });
     }
     const conversation = this.#conversations.get(rest[0] ?? "");
     if (conversation === undefined) return json(404, { error: "conversation_not_found" });
     if (rest[1] === "messages" && method === "POST") {
       if (!checkMessage()) return json(400, { error: "invalid_request" });
       conversation.events.push(reply(rest[0] ?? ""));
-      return json(202, { conversation_id: rest[0], status: "idle", responder: "agent" });
+      return json(
+        202,
+        isV4 ? { conversation_id: rest[0] } : { conversation_id: rest[0], ...state() },
+      );
     }
     if (rest[1] === "events" && method === "GET") {
+      if (this.scenario.slowAgent === true) {
+        // A second read means the agent didn't stop while the Company still had work (8.7).
+        if (this.#reads > 0) this.pass("conversation.working");
+        this.#reads++;
+      }
       const cursor = url.searchParams.get("cursor");
       const start =
         cursor === null ? 0 : conversation.events.findIndex((e) => e["id"] === cursor) + 1;
@@ -847,12 +1290,32 @@ export class ConformanceCompany {
         events,
         cursor: events.at(-1)?.["id"] ?? cursor,
         has_more: false,
-        status: "idle",
-        responder: "agent",
+        ...state(),
       });
     }
-    if (rest[1] === "close" && method === "POST")
-      return json(200, { status: "closed", responder: "agent" });
+    if (rest[1] === "handoff" && method === "POST") {
+      // Withdrawing a handoff is 0.4 only (spec 8.9).
+      if (rest[2] === "cancel" && !isV4) return json(404, { error: "not_found" });
+      if (rest[2] !== undefined && rest[2] !== "cancel") return json(404, { error: "not_found" });
+      if (isV4 && checkRequestId() === undefined) return json(400, { error: "invalid_request" });
+      if (rest[2] === "cancel") {
+        if (this.#handoff === "pending") this.pass("conversation.handoff-cancel");
+        else
+          this.fail("conversation.handoff-cancel", "withdrew a handoff that was never asked for");
+        this.#handoff = "none";
+      } else this.#handoff = "pending";
+      return json(
+        202,
+        isV4 ? { conversation_id: rest[0] } : { status: "queued", responder: "agent" },
+      );
+    }
+    if (rest[1] === "close" && method === "POST") {
+      if (isV4 && checkRequestId() === undefined) return json(400, { error: "invalid_request" });
+      // A close returns 200 on 0.3 and 202 from 0.4, which acts on it after responding (spec 8.12).
+      return isV4
+        ? json(202, { conversation_id: rest[0] })
+        : json(200, { status: "closed", responder: "agent" });
+    }
     return json(404, { error: "not_found" });
   }
 }

@@ -174,6 +174,17 @@ export function postForm(
   });
 }
 
+/**
+ * Drops trailing slashes without a regular expression. `/\/+$/` over a value a Company controls
+ * backtracks on a long run of slashes (CodeQL `js/polynomial-redos`), and resource identifiers come
+ * from documents the Company writes.
+ */
+export function withoutTrailingSlashes(value: string): string {
+  let end = value.length;
+  while (end > 0 && value.charCodeAt(end - 1) === 47) end--;
+  return end === value.length ? value : value.slice(0, end);
+}
+
 export function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }

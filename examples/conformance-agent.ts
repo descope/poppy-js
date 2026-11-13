@@ -12,6 +12,7 @@ import {
   type Company,
   operationFromResponse,
   PoppyAgent,
+  PoppyError,
   type PoppyUser,
   type Session,
 } from "../src/index.ts";
@@ -22,7 +23,13 @@ type Step =
   | { action: "sign_in"; scopes: string[] }
   | { action: "sign_out" }
   | { action: "converse"; text: string }
-  | { action: "request_with_approval"; url: string; method: string; body: string };
+  | { action: "request_with_approval"; url: string; method: string; body: string }
+  | { action: "task_coverage" }
+  | { action: "report_task"; task: string; description: string }
+  | { action: "join_browser" }
+  | { action: "fetch_page"; url: string }
+  | { action: "handoff_then_cancel"; text: string }
+  | { action: "read_skill"; name: string };
 
 interface Context {
   steps: Step[];
@@ -96,6 +103,51 @@ async function run(step: Step): Promise<void> {
       await conversation.readAll();
       return;
     }
+    case "task_coverage":
+      // 0.3 reads the excluded tasks document; 0.4 gets all three from tasks.endpoint (spec 9).
+      await ready().session.taskCoverage();
+      return;
+    case "report_task":
+      await ready().session.sendFeedback({ task: step.task, description: step.description });
+      return;
+    case "join_browser": {
+      const { company: c, session: s } = ready();
+      const endpoint = c.browserSessionEndpoint;
+      if (endpoint === undefined) throw new Error("the Company lists no browser_session_endpoint");
+      // The agent's own browser: load the page, read the code out of its form, submit it.
+      const page = await (await fetch(endpoint)).text();
+      const code = /name="code" value="([^"]+)"/.exec(page)?.[1] ?? "";
+      try {
+        await s.authorizeBrowserCode(code);
+      } catch (error) {
+        // From 0.4 a signed-in join needs poppy:browser-sign-in; without it, join signed out.
+        if (!(error instanceof PoppyError) || error.error !== "insufficient_scope") throw error;
+        await s.authorizeBrowserCode(code, { signedOut: true });
+      }
+      await fetch(`${endpoint.replace(/\/$/, "")}/submit`, {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({ code }).toString(),
+      });
+      return;
+    }
+    case "fetch_page": {
+      const response = await ready().session.fetchPage(step.url);
+      await response.body?.cancel();
+      return;
+    }
+    case "handoff_then_cancel": {
+      const { conversation } = await ready().session.conversations().start({ text: step.text });
+      // Read until the Company has no work in progress before deciding anything (spec 8.7).
+      let update = await conversation.readAll({ wait: 1 });
+      while (update.working) update = await conversation.readAll({ wait: 1 });
+      await conversation.handoff();
+      await conversation.cancelHandoff();
+      return;
+    }
+    case "read_skill":
+      await ready().session.fetchSkill(step.name);
+      return;
     case "request_with_approval": {
       const { session: s } = ready();
       const init = { method: step.method, body: step.body };

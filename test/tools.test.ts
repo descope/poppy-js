@@ -43,6 +43,7 @@ describe("poppyTools", () => {
       "poppy_conversation_read",
       "poppy_conversation_handoff",
       "poppy_conversation_close",
+      "poppy_report_unsupported_task",
     ]);
     expect(names(poppyTools({ user, signIn, prefix: "example" }))).toContain("example_sign_in");
     expect(() => poppyTools({ user, prefix: "bad prefix" })).toThrow(TypeError);
